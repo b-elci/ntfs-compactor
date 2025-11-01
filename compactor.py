@@ -24,6 +24,7 @@ import queue
 import subprocess
 import ctypes
 from ctypes import wintypes
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -229,12 +230,18 @@ class App(tk.Tk):
         top = ttk.Frame(frm)
         top.pack(fill="x", pady=(0,8))
 
+        # Left side: folder controls
         ttk.Label(top, text="Folder:").pack(side="left")
         self.ent_folder = ttk.Entry(top, textvariable=self.folder, width=70)
         self.ent_folder.pack(side="left", padx=6)
         ttk.Button(top, text="Browse...", command=self.choose_folder).pack(side="left")
         self.defer_measure = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Defer measurement", variable=self.defer_measure).pack(side="left", padx=8)
+
+        # Right side: Support button (opens Buy Me a Coffee link)
+        # Using a unicode coffee emoji to avoid external image dependencies.
+        btn_support = ttk.Button(top, text="☕ Support", command=lambda: webbrowser.open_new_tab("https://buymeacoffee.com/bariselcii"))
+        btn_support.pack(side="right")
 
         self.size_label = ttk.Label(frm, text="On Disk: - / Actual: -")
         self.size_label.pack(fill="x", pady=(0,6))
