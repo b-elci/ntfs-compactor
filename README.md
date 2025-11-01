@@ -46,8 +46,8 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 
 1. **Download the latest release**
    - Go to [Releases](https://github.com/b-elci/ntfs-compactor/releases)
-   - Download `NTFS-Compactor-v1.0.0-Windows.zip`
-   - Extract and run `NTFS-Compactor-v1.0.0.exe` as administrator
+   - Download `NTFS-Compactor-v1.0.1-Windows.zip`
+   - Extract and run `NTFS-Compactor-v1.0.1.exe` as administrator
    - No Python installation needed!
 
 2. **Or clone the repository** (for Python users)
