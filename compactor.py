@@ -90,6 +90,8 @@ def compact_query_line_for_algorithm(line):
 def run_compact(args, cwd=None):
     cmd = ["compact.exe"] + args
     try:
+        # CREATE_NO_WINDOW flag prevents console window from appearing
+        CREATE_NO_WINDOW = 0x08000000
         p = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -97,7 +99,8 @@ def run_compact(args, cwd=None):
             encoding="utf-8",       # encoding added
             errors="ignore",        # ignore problematic characters
             cwd=cwd,
-            check=False
+            check=False,
+            creationflags=CREATE_NO_WINDOW  # Prevents console window flashing
         )
         return p.returncode, p.stdout
     except Exception as e:

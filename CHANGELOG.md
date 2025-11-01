@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2025-11-01
+
+### Fixed
+- Fixed console window flashing issue when processing files
+- Added CREATE_NO_WINDOW flag to subprocess calls to prevent console windows from appearing
+- Improved performance by eliminating window creation overhead
+
+### Changed
+- Optimized subprocess execution for better performance and smoother user experience
+
 ## [1.0.0] - 2025-11-01
 
 ### Added
