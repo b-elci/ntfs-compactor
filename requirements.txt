@@ -1,0 +1,15 @@
+# NTFS Advanced Compression Tool - Dependencies
+
+# This application uses only Python standard library modules.
+# No external dependencies are required!
+
+# Minimum Python version: 3.6+
+
+# Standard library modules used:
+# - os
+# - sys
+# - threading
+# - queue
+# - subprocess
+# - ctypes
+# - tkinter (included with Python on Windows)
