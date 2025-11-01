@@ -1,0 +1,72 @@
+================================================================================
+  NTFS Advanced Compression Tool - CHANGELOG
+================================================================================
+
+[Version 1.0.1] - 01 Kasım 2025
+--------------------------------
+
+DÜZELTİLEN SORUNLAR:
+  ✓ Dosya işlenirken sürekli açılıp kapanan konsol pencereleri sorunu düzeltildi
+  ✓ Ekran kırpışması ve sinir bozucu görüntü ortadan kaldırıldı
+  ✓ CREATE_NO_WINDOW bayrağı eklenerek subprocess'ler arka planda çalışıyor
+
+İYİLEŞTİRMELER:
+  ✓ Performans artışı - konsol penceresi oluşturma maliyeti ortadan kalktı
+  ✓ Daha düzgün ve profesyonel kullanıcı deneyimi
+  ✓ Sistem kaynakları daha verimli kullanılıyor
+
+
+[Version 1.0.0] - 01 Kasım 2025
+--------------------------------
+
+İLK SÜRÜM - ÖZELLİKLER:
+
+TEMEL ÖZELLİKLER:
+  ✓ Modern Tkinter tabanlı GUI arayüz
+  ✓ Klasör seçimi ve toplu sıkıştırma
+  ✓ Gerçek zamanlı ilerleme çubuğu
+  ✓ Canlı log çıktısı
+  ✓ İşlemi durdurma özelliği
+
+SIKIŞTIRMA ALGORİTMALARI:
+  ✓ XPRESS4K - Hızlı, düşük sıkıştırma
+  ✓ XPRESS8K - Orta, dengeli
+  ✓ XPRESS16K - Yavaş, yüksek sıkıştırma
+  ✓ LZX - Ultra, maksimum sıkıştırma
+
+DAVRANIŞ SEÇENEKLERİ:
+  ✓ Skip - Zaten sıkıştırılmış dosyaları atla
+  ✓ Recompress - Farklı algoritma varsa yeniden sıkıştır
+
+DURUM GÖRÜNTÜLEME:
+  ✓ Mevcut sıkıştırma durumunu görüntüleme
+  ✓ Hangi algoritma kullanıldığını gösterme
+  ✓ Boyut karşılaştırması (gerçek → disk)
+  ✓ Tasarruf yüzdesi hesaplama
+  ✓ Dosya-dosya detaylı rapor
+
+EK ÖZELLİKLER:
+  ✓ Defer measurement - Büyük klasörler için hızlı başlangıç
+  ✓ Önce/sonra disk alanı karşılaştırması
+  ✓ Windows API ile doğru boyut hesaplama
+  ✓ Uzun dosya yolları desteği
+  ✓ Hata yönetimi ve erişim kontrolleri
+
+TEKNİK DETAYLAR:
+  ✓ Windows compact.exe kullanımı
+  ✓ GetCompressedFileSizeW API entegrasyonu
+  ✓ Çok thread'li mimari (responsive UI)
+  ✓ Sadece standart kütüphane - harici bağımlılık yok
+  ✓ Python 3.6+ uyumlu
+  ✓ Windows 10/11 ve NTFS gereksinimi
+
+DOKÜMANTASYON:
+  ✓ Detaylı README dosyası
+  ✓ Kullanım kılavuzu ve örnekler
+  ✓ Sorun giderme bölümü
+  ✓ En iyi pratikler rehberi
+  ✓ MIT Lisansı
+
+================================================================================
+Daha fazla bilgi: https://github.com/b-elci/ntfs-compactor
+================================================================================
