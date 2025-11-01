@@ -6,6 +6,8 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 ![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/bariselcii)
+
 ## Features
 
 - 🗜️ **Multiple Compression Algorithms**
@@ -191,6 +193,14 @@ Created with ❤️ for the Windows power user community
 If you encounter any issues or have questions:
 - Open an issue on GitHub
 - Check existing issues for solutions
+
+## Support the Project
+
+If you find this tool useful, consider supporting its development:
+
+☕ **[Buy Me a Coffee](https://buymeacoffee.com/bariselcii)**
+
+Your support helps maintain and improve this project!
 
 ---
 
