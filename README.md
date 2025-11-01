@@ -44,16 +44,22 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 
 ## Installation
 
-1. **Clone the repository**
+1. **Download the latest release**
+   - Go to [Releases](https://github.com/b-elci/ntfs-compactor/releases)
+   - Download `NTFS-Compactor-v1.0.0-Windows.zip`
+   - Extract and run `NTFS-Compactor-v1.0.0.exe` as administrator
+   - No Python installation needed!
+
+2. **Or clone the repository** (for Python users)
    ```bash
-   git clone https://github.com/yourusername/ntfs-compactor.git
+   git clone https://github.com/b-elci/ntfs-compactor.git
    cd ntfs-compactor
    ```
 
-2. **No external dependencies required!**
+3. **No external dependencies required!**
    The application uses only Python standard library modules.
 
-3. **Run the application**
+4. **Run the application**
    ```bash
    python compactor.py
    ```
@@ -170,10 +176,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Built with Python's Tkinter for cross-version compatibility
 - Uses Windows API for accurate size reporting
 - Leverages Windows built-in `compact.exe` utility
+- Icon: [Data compression icons created by Freepik - Flaticon](https://www.flaticon.com/free-icons/data-compression)
 
 ## Author
 
-Barış Elçi; Created with ❤️ for the Windows power user community
+**Barış Elçi** ([b-elci](https://github.com/b-elci))
+
+Created with ❤️ for the Windows power user community
 
 ## Support
 
