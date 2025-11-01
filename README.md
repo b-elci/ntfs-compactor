@@ -122,7 +122,9 @@ This tool wraps the Windows `compact.exe` command-line utility with a modern GUI
 
 ## Screenshots
 
-![Main Interface](https://via.placeholder.com/800x600.png?text=Screenshot+Coming+Soon)
+![NTFS Compactor Main Interface](screenshot.png)
+
+*The modern GUI interface showing compression options, progress tracking, and live output.*
 
 ## Important Notes
 
