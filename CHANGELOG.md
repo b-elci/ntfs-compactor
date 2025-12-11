@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2025-12-11
+
+### Added
+- **Verbose Logging Option**: Added a checkbox to toggle verbose logging. Default is off for cleaner output.
+- **Smart Progress Bar**: New ASCII-based progress bar in the log window when verbose mode is disabled.
+- **Error Summary**: Real-time error counting (Long Path / Other) displayed in the status line.
+- **OOM Prevention**: Implemented proactive skipping of paths longer than 255 characters to prevent "Out of Memory" errors.
+- **Memory Management**: Dynamic batch sizing based on available RAM to prevent UI freezing on large datasets.
+
+### Changed
+- **UI Performance**: Significantly optimized log rendering with batching and truncation to handle millions of lines without lag.
+- **Default Settings**: "Defer measurement" is now enabled by default for faster startup.
+- **Log Format**: Improved log readability by showing parent folders.
+- **Process Handling**: Optimized `compact.exe` calls using relative paths (`cwd`) to support deeper directory structures.
+
 ## [1.0.1] - 2025-11-01
 
 ### Fixed

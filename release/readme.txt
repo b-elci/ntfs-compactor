@@ -1,7 +1,7 @@
-NTFS Compactor — Release
+NTFS Compactor v1.1.0 — Release
 
 This release contains:
-- compactor.py (Python script)
+- NTFS-Compactor-v1.1.0.exe (Application)
 - resources\bmac.svg (support icon)
 - LICENSE
 - readme.txt (this file)
@@ -10,8 +10,8 @@ Support the project:
 Visit https://buymeacoffee.com/bariselcii to buy me a coffee. Thank you!
 
 Usage:
-Run the program on Windows with Python 3.6+:
+Run the application on Windows (Administrator rights required for compression):
 
-    python compactor.py
+    Double-click NTFS-Compactor-v1.1.0.exe
 
-Administrator rights are required to apply compression operations.
+No installation required. Portable executable.

@@ -25,12 +25,13 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 - 🎯 **Smart Compression Options**
   - Skip already compressed files
   - Recompress files if algorithm differs
-  - Defer initial measurement for faster startup
+  - Defer initial measurement for faster startup (Default: On)
+  - Verbose logging toggle for detailed output control
 
 - 💻 **User-Friendly Interface**
   - Modern Tkinter GUI
-  - Real-time progress tracking
-  - Live log output
+  - Real-time ASCII progress bar (in non-verbose mode)
+  - Live log output with performance optimizations
   - Stop operation at any time
 
 - 📈 **Comprehensive Reporting**
