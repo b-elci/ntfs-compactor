@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-06
+
+### Added
+- Exact XPRESS4K, XPRESS8K, XPRESS16K, and LZX detection through the Windows `WofIsExternalFile` API.
+- Automated tests for compression decision logic and forced recompression.
+- Version number in the application window title.
+
+### Changed
+- Replaced locale-dependent `compact.exe` output parsing with direct Windows API queries.
+- Skips files that already use the selected algorithm before starting batch compression.
+- Recompression now uses `compact /F`, changing algorithms correctly in a single operation.
+- UI progress and status updates are routed through the main thread for improved responsiveness and stability.
+- Updated release documentation and download instructions.
+
+### Fixed
+- Fixed XPRESS8K and XPRESS16K being treated as an ambiguous shared algorithm.
+- Fixed "Recompress if different" potentially failing to change the compression algorithm.
+- Fixed unnecessary processing of files already compressed with the selected algorithm.
+
 ## [1.1.0] - 2025-12-11
 
 ### Added
@@ -67,4 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Troubleshooting section
 - Best practices guide
 
+[1.2.0]: https://github.com/b-elci/ntfs-compactor/releases/tag/v1.2.0
+[1.1.0]: https://github.com/b-elci/ntfs-compactor/releases/tag/v1.1.0
+[1.0.1]: https://github.com/b-elci/ntfs-compactor/releases/tag/v1.0.1
 [1.0.0]: https://github.com/b-elci/ntfs-compactor/releases/tag/v1.0.0

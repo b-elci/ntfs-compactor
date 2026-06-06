@@ -27,6 +27,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import re
 
+APP_VERSION = "1.2.0"
+
 # -------------------------
 # Windows API — size and attribute helpers
 # -------------------------
@@ -458,7 +460,7 @@ BEHAVIOR_OPTIONS = [
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("NTFS Advanced Compression (XPRESS/LZX)")
+        self.title(f"NTFS Advanced Compression v{APP_VERSION} (XPRESS/LZX)")
         self.geometry("980x640")
 
         self.folder = tk.StringVar()
