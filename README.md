@@ -113,9 +113,10 @@ Uncompressed | -            | 2.00 MB → 2.00 MB   | 0%        | C:\path\to\fil
 
 This tool wraps the Windows `compact.exe` command-line utility with a modern GUI:
 
-1. **Status Checking**: Queries file compression status using `compact /q`
+1. **Status Checking**: Queries exact XPRESS/LZX status using Windows' `WofIsExternalFile` API
 2. **Compression**: Applies compression using `compact /c /exe:algorithm`
-3. **Size Measurement**: Uses Windows API `GetCompressedFileSizeW` for accurate disk space reporting
+3. **Recompression**: Changes differing algorithms directly using `compact /F`
+4. **Size Measurement**: Uses Windows API `GetCompressedFileSizeW` for accurate disk space reporting
 
 ### Compression Algorithms
 

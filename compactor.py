@@ -9,13 +9,11 @@
 # - Only files are listed, folders don't appear in report
 # - Long paths are wrapped in Text widget
 # - Size on disk: GetCompressedFileSizeW
-# - Two ways to detect current algorithm:
-#    1) Via compact /q - if line contains "(LZX|XPRESS4K|...)" parse it
-#    2) Otherwise check Windows attribute for "compressed" (probably LZNT1)
+# - Exact XPRESS/LZX detection through WofIsExternalFile
+# - Legacy NTFS compression detection through the compressed file attribute
 #
 # Notes:
-# - Output language varies by Windows locale, but algorithm names (LZX/XPRESS*) appear verbatim.
-# - "Recompress if algorithm differs" in safe mode, file by file: first /u, then /c /exe:ALG
+# - "Recompress if algorithm differs" uses compact /F
 
 import os
 import sys
@@ -78,6 +76,33 @@ def get_optimal_batch_size():
     return 10
 
 FILE_ATTRIBUTE_COMPRESSED = 0x800
+WOF_PROVIDER_FILE = 2
+
+WOF_ALGORITHMS = {
+    0: "XPRESS4K",
+    1: "LZX",
+    2: "XPRESS8K",
+    3: "XPRESS16K",
+}
+
+class WofFileCompressionInfo(ctypes.Structure):
+    _fields_ = [
+        ("Algorithm", wintypes.ULONG),
+        ("Flags", wintypes.ULONG),
+    ]
+
+try:
+    wofutil = ctypes.WinDLL("Wofutil.dll")
+    wofutil.WofIsExternalFile.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(wintypes.ULONG),
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    wofutil.WofIsExternalFile.restype = wintypes.LONG
+except OSError:
+    wofutil = None
 
 def get_folder_sizes(folder):
     total_orig = 0
@@ -109,6 +134,30 @@ def is_compressed_attribute(path):
     if attrs == 0xFFFFFFFF:
         return None  # access error
     return bool(attrs & FILE_ATTRIBUTE_COMPRESSED)
+
+def get_compression_algorithm(path):
+    """Return the exact WOF algorithm, LZNT1/Unknown, "-", or None on access error."""
+    if wofutil is not None:
+        is_external = wintypes.BOOL()
+        provider = wintypes.ULONG()
+        info = WofFileCompressionInfo()
+        info_size = wintypes.ULONG(ctypes.sizeof(info))
+        result = wofutil.WofIsExternalFile(
+            path,
+            ctypes.byref(is_external),
+            ctypes.byref(provider),
+            ctypes.byref(info),
+            ctypes.byref(info_size),
+        )
+        if result == 0 and is_external.value:
+            if provider.value == WOF_PROVIDER_FILE:
+                return WOF_ALGORITHMS.get(info.Algorithm, "WOF/Unknown")
+            return "External/Unknown"
+
+    compressed = is_compressed_attribute(path)
+    if compressed is None:
+        return None
+    return "LZNT1/Unknown" if compressed else "-"
 
 # -------------------------
 # compact.exe helpers
@@ -146,13 +195,13 @@ def compact_query_folder(folder):
     """Return output from compact /s:"folder" (without /q to ensure file listing)."""
     return run_compact(["/s:{}".format(folder)])
 
-def compact_compress_file(path, algorithm_switch):
+def compact_compress_file(path, algorithm_switch, force=False):
     """Compress specified file with selected algorithm (/c /exe:xxx)."""
-    return run_compact(["/c", "/i", "/exe:{}".format(algorithm_switch), path])
-
-def compact_uncompress_file(path):
-    r, out = run_compact(["/u", "/i", path])
-    return r, out  # also log the output
+    args = ["/c", "/i"]
+    if force:
+        args.append("/f")
+    args.extend(["/exe:{}".format(algorithm_switch), path])
+    return run_compact(args)
 
 def run_compact_stream(args, files, callback_line, stop_event=None, progress_callback=None):
     """Run compact.exe on a batch of files, streaming output to callback."""
@@ -312,6 +361,14 @@ def iter_files_under(folder):
         for name in files:
             yield os.path.join(root, name)
 
+def compression_action(current_alg, target_alg, behavior):
+    """Return skip, compress, or recompress for a file."""
+    if not current_alg:
+        return "compress"
+    if behavior == "skip" or current_alg.casefold() == target_alg.casefold():
+        return "skip"
+    return "recompress"
+
 def detect_algorithm_via_compact_map(folder):
     """Parse compact /s output line by line:
        Extract path -> algorithm mapping based on flags:
@@ -413,6 +470,7 @@ class App(tk.Tk):
 
         # thread communication
         self.log_q = queue.Queue()
+        self.ui_q = queue.Queue()
         self.worker = None
         self.stop_flag = threading.Event()
 
@@ -535,6 +593,24 @@ class App(tk.Tk):
             
             if messages:
                 self.append_log_batch(messages)
+
+            latest_progress = None
+            while True:
+                try:
+                    action, value = self.ui_q.get_nowait()
+                except queue.Empty:
+                    break
+                if action == "progress":
+                    latest_progress = value
+                elif action == "progress_max":
+                    self.progress["maximum"] = value
+                    self.progress["value"] = 0
+                elif action == "enable":
+                    self._enable_actions()
+                elif action == "size":
+                    self.size_label.config(text=value)
+            if latest_progress is not None:
+                self.progress["value"] = latest_progress
                 
         except Exception:
             pass
@@ -594,11 +670,7 @@ class App(tk.Tk):
             try:
                 files = list(iter_files_under(folder))
                 total = len(files)
-                self.progress["maximum"] = max(total, 1)
-                self.progress["value"] = 0
-
-                # Extract algorithm map if possible (compact /q /s)
-                algomap = detect_algorithm_via_compact_map(folder)
+                self.ui_q.put(("progress_max", max(total, 1)))
 
                 # Header
                 self.log_q.put("Status | Algorithm | Size → On Disk | Savings % | File Path")
@@ -611,14 +683,11 @@ class App(tk.Tk):
 
                     try:
                         # Algorithm
-                        alg = algomap.get(path)
-                        if not alg:
-                            comp_attr = is_compressed_attribute(path)
-                            if comp_attr is None:
-                                # no access
-                                self.log_q.put(f"[Error: Access denied] {path}")
-                                continue
-                            alg = "LZNT1/Unknown" if comp_attr else "-"
+                        alg = get_compression_algorithm(path)
+                        if alg is None:
+                            self.log_q.put(f"[Error: Access denied] {path}")
+                            self.ui_q.put(("progress", idx))
+                            continue
 
                         # Sizes
                         try:
@@ -638,10 +707,10 @@ class App(tk.Tk):
                     except Exception as e:
                         self.log_q.put(f"[Error: {e}] {path}")
 
-                    self.progress["value"] = idx
+                    self.ui_q.put(("progress", idx))
 
             finally:
-                self._enable_actions()
+                self.ui_q.put(("enable", None))
 
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
@@ -681,24 +750,20 @@ class App(tk.Tk):
         def worker():
             try:
                 self.log_q.put("Performing initial measurement (this may take a while)...")
-                self.after(0, lambda: self.size_label.config(text="Performing initial measurement..."))
+                self.ui_q.put(("size", "Performing initial measurement..."))
                 
                 orig, disk = get_folder_sizes(folder)
                 self.before_disk = disk
                 
                 res_text = f"On Disk (Initial): {fmt_bytes(disk)} / Actual: {fmt_bytes(orig)}"
-                self.after(0, lambda: self.size_label.config(text=res_text))
+                self.ui_q.put(("size", res_text))
                 self.log_q.put(f"Initial size: {fmt_bytes(disk)} (On Disk) / {fmt_bytes(orig)} (Actual)")
 
                 self.log_q.put("Listing files...")
                 files = list(iter_files_under(folder))
                 total = len(files)
-                self.progress["maximum"] = max(total, 1)
-                self.progress["value"] = 0
+                self.ui_q.put(("progress_max", max(total, 1)))
                 self.log_q.put(f"Found {total} files. Analyzing compression status...")
-
-                # Current algorithms (if any) — will use for decision
-                algomap = detect_algorithm_via_compact_map(folder)
                 
                 to_compress = []
 
@@ -708,34 +773,14 @@ class App(tk.Tk):
                         return
 
                     try:
-                        # Behavior logic:
-                        should_compress = True # Default to compress unless skipped
-                        
-                        # Normalize path for lookup
-                        norm_path = os.path.normcase(os.path.abspath(path))
-                        
-                        current_alg = None
-                        if norm_path in algomap:
-                            current_alg = algomap[norm_path]  # LZX/XPRESS*
-                        else:
-                            comp_attr = is_compressed_attribute(path)
-                            if comp_attr:
-                                current_alg = "LZNT1/Unknown"
+                        current_alg = get_compression_algorithm(path)
+                        if current_alg is None:
+                            self.log_q.put(f"[Error: Access denied] {path}")
+                            continue
+                        if current_alg == "-":
+                            current_alg = None
 
-                        if behavior == "recompress_if_different":
-                            if current_alg:
-                                # Same? skip; different? recompress (force)
-                                if current_alg == "XPRESS8K/16K":
-                                    # Ambiguous case: if target is 8K or 16K, assume match to avoid loop
-                                    if alg_switch.upper() in ["XPRESS8K", "XPRESS16K"]:
-                                        should_compress = False
-                                elif current_alg.upper() == alg_switch.upper():
-                                    should_compress = False # Already same algo
-                        elif behavior == "skip":
-                             if current_alg:
-                                 should_compress = False
-                        
-                        if should_compress:
+                        if compression_action(current_alg, alg_switch, behavior) != "skip":
                             to_compress.append(path)
 
                     except Exception as e:
@@ -743,6 +788,7 @@ class App(tk.Tk):
 
                     if is_verbose and idx % 100 == 0:
                          self.log_q.put(f"Analyzed {idx}/{total} files...")
+                    self.ui_q.put(("progress", idx))
 
                 self.log_q.put(f"Analysis complete. Compressing {len(to_compress)} files.")
                 
@@ -750,8 +796,7 @@ class App(tk.Tk):
                 self.log_q.put(f"Batch size calculated: {batch_size} files per chunk (based on system memory).")
 
                 total_ops = len(to_compress)
-                self.progress["maximum"] = max(total_ops, 1)
-                self.progress["value"] = 0
+                self.ui_q.put(("progress_max", max(total_ops, 1)))
                 
                 current_progress = 0
                 current_header_dir = ""
@@ -793,7 +838,7 @@ class App(tk.Tk):
                 def progress_cb(count):
                     nonlocal current_progress
                     current_progress += count
-                    self.progress["value"] = current_progress
+                    self.ui_q.put(("progress", current_progress))
                     if not is_verbose:
                         update_status_line()
 
@@ -912,13 +957,12 @@ class App(tk.Tk):
                 self.log_q.put("\nFinished.")
 
             finally:
-                self._enable_actions()
+                self.ui_q.put(("enable", None))
                 orig, disk = get_folder_sizes(folder)
                 text = f"On Disk: {fmt_bytes(disk)} / Actual: {fmt_bytes(orig)}"
                 if self.before_disk:
                     text += f"   (Before: {fmt_bytes(self.before_disk)})"
-                self.after(0, lambda: self.size_label.config(text=text))
-                self.progress["value"] = self.progress["maximum"]
+                self.ui_q.put(("size", text))
 
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
