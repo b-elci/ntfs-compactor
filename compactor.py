@@ -458,6 +458,19 @@ BEHAVIOR_OPTIONS = [
     ("Recompress file by file if algorithm differs", "recompress_if_different"),
 ]
 
+# Status report Treeview columns
+# (column_id, header_label, default_width, anchor)
+STATUS_COLUMNS = [
+    ("status",    "Status",    90,  "w"),
+    ("algorithm", "Algorithm", 90,  "w"),
+    ("size",      "Size",      90,  "e"),
+    ("ondisk",    "On Disk",   90,  "e"),
+    ("savings",   "Savings %", 80,  "e"),
+    ("path",      "File Path", 480, "w"),
+]
+STATUS_COL_IDS = [c[0] for c in STATUS_COLUMNS]
+STATUS_COL_HEADINGS = {c[0]: c[1] for c in STATUS_COLUMNS}
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -526,10 +539,10 @@ class App(tk.Tk):
         self.btn_status = ttk.Button(btns, text="Show Status", command=self.on_status)
         self.btn_status.pack(side="left")
 
-        self.btn_save_report = ttk.Button(btns, text="Save Report...", command=self.save_report_csv, state="disabled")
+        self.btn_save_report = ttk.Button(btns, text="Save Report...", command=self.on_save_report, state="disabled")
         self.btn_save_report.pack(side="left", padx=6)
 
-        self.btn_clear_report = ttk.Button(btns, text="Clear Report", command=self.clear_report, state="disabled")
+        self.btn_clear_report = ttk.Button(btns, text="Clear Report", command=self.on_clear_report, state="disabled")
         self.btn_clear_report.pack(side="left", padx=6)
 
         self.btn_compress = ttk.Button(btns, text="Compress", command=self.on_compress)
@@ -544,68 +557,67 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(pfrm, mode="determinate")
         self.progress.pack(fill="x")
 
-        # Output area: Notebook with Status Report (Treeview) and Compression Log (Text)
-        outfrm = ttk.LabelFrame(frm, text="Output / Report")
-        outfrm.pack(fill="both", expand=True)
-
-        self.notebook = ttk.Notebook(outfrm)
+        # Notebook with two tabs: Status Report (Treeview) and Compression Log (Text)
+        self.notebook = ttk.Notebook(frm)
         self.notebook.pack(fill="both", expand=True)
 
-        # --- Tab 1: Status Report (Treeview) ---
-        self.report_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.report_frame, text="Status Report")
+        # --- Status Report tab ---
+        status_tab = ttk.Frame(self.notebook)
+        self.notebook.add(status_tab, text="Status Report")
 
-        self.report_columns = ("status", "algorithm", "size", "ondisk", "savings", "path")
-        self.report_tree = ttk.Treeview(
-            self.report_frame,
-            columns=self.report_columns,
+        status_outer = ttk.Frame(status_tab)
+        status_outer.pack(fill="both", expand=True)
+
+        self.status_tree = ttk.Treeview(
+            status_outer,
+            columns=STATUS_COL_IDS,
             show="headings",
             selectmode="extended",
         )
-        self.report_tree.heading("status", text="Status", command=lambda: self._sort_tree("status"))
-        self.report_tree.heading("algorithm", text="Algorithm", command=lambda: self._sort_tree("algorithm"))
-        self.report_tree.heading("size", text="Size", command=lambda: self._sort_tree("size"))
-        self.report_tree.heading("ondisk", text="On Disk", command=lambda: self._sort_tree("ondisk"))
-        self.report_tree.heading("savings", text="Savings %", command=lambda: self._sort_tree("savings"))
-        self.report_tree.heading("path", text="File Path", command=lambda: self._sort_tree("path"))
+        for col_id, label, width, anchor in STATUS_COLUMNS:
+            self.status_tree.heading(
+                col_id,
+                text=label,
+                command=lambda c=col_id: self._sort_status(c),
+            )
+            self.status_tree.column(col_id, width=width, anchor=anchor, stretch=(col_id == "path"))
 
-        self.report_tree.column("status", width=110, anchor="w", stretch=False)
-        self.report_tree.column("algorithm", width=110, anchor="w", stretch=False)
-        self.report_tree.column("size", width=100, anchor="e", stretch=False)
-        self.report_tree.column("ondisk", width=100, anchor="e", stretch=False)
-        self.report_tree.column("savings", width=90, anchor="e", stretch=False)
-        self.report_tree.column("path", width=400, anchor="w", stretch=True)
+        # Configure zebra striping tags
+        self.status_tree.tag_configure("oddrow", background="#f5f5f5")
+        self.status_tree.tag_configure("evenrow", background="#ffffff")
 
-        # Zebra striping tag
-        self.report_tree.tag_configure("oddrow", background="#f5f5f5")
-        self.report_tree.tag_configure("evenrow", background="#ffffff")
+        vsb = ttk.Scrollbar(status_outer, orient="vertical", command=self.status_tree.yview)
+        hsb = ttk.Scrollbar(status_outer, orient="horizontal", command=self.status_tree.xview)
+        self.status_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
-        rep_vscroll = ttk.Scrollbar(self.report_frame, orient="vertical", command=self.report_tree.yview)
-        rep_hscroll = ttk.Scrollbar(self.report_frame, orient="horizontal", command=self.report_tree.xview)
-        self.report_tree.configure(yscrollcommand=rep_vscroll.set, xscrollcommand=rep_hscroll.set)
+        self.status_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        status_outer.rowconfigure(0, weight=1)
+        status_outer.columnconfigure(0, weight=1)
 
-        self.report_tree.grid(row=0, column=0, sticky="nsew")
-        rep_vscroll.grid(row=0, column=1, sticky="ns")
-        rep_hscroll.grid(row=1, column=0, sticky="ew")
-        self.report_frame.rowconfigure(0, weight=1)
-        self.report_frame.columnconfigure(0, weight=1)
+        # Right-click context menu for the status report
+        self.status_menu = tk.Menu(self, tearoff=0)
+        self.status_menu.add_command(label="Copy Row", command=self._copy_status_row)
+        self.status_menu.add_command(label="Copy All", command=self._copy_status_all)
+        self.status_menu.add_separator()
+        self.status_menu.add_command(label="Save as CSV...", command=self.on_save_report)
+        self.status_tree.bind("<Button-3>", self._show_status_menu)
 
-        # Right-click context menu on the Treeview
-        self.tree_menu = tk.Menu(self, tearoff=0)
-        self.tree_menu.add_command(label="Copy Row", command=self._copy_row)
-        self.tree_menu.add_command(label="Copy All", command=self._copy_all)
-        self.tree_menu.add_separator()
-        self.tree_menu.add_command(label="Save as CSV...", command=self.save_report_csv)
-        self.report_tree.bind("<Button-3>", self._show_tree_menu)
-        self.report_tree.bind("<Control-Button-1>", self._show_tree_menu)
+        # Storage backing the Treeview (used for sorting)
+        self._status_raw = {}  # iid -> dict of raw values keyed by column id
+        self._status_sort_state = {}  # col_id -> "asc" | "desc"
+        self._status_row_count = 0
 
-        # --- Tab 2: Compression Log (Text) ---
-        self.log_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.log_frame, text="Compression Log")
+        # --- Compression Log tab ---
+        log_tab = ttk.Frame(self.notebook)
+        self.notebook.add(log_tab, text="Compression Log")
 
-        self.txt = tk.Text(self.log_frame, wrap="word", height=24)
+        logfrm = ttk.Frame(log_tab)
+        logfrm.pack(fill="both", expand=True)
+        self.txt = tk.Text(logfrm, wrap="word", height=24)
         self.txt.pack(side="left", fill="both", expand=True)
-        yscroll = ttk.Scrollbar(self.log_frame, orient="vertical", command=self.txt.yview)
+        yscroll = ttk.Scrollbar(logfrm, orient="vertical", command=self.txt.yview)
         yscroll.pack(side="right", fill="y")
         self.txt.configure(yscrollcommand=yscroll.set)
 
@@ -632,88 +644,6 @@ class App(tk.Tk):
     def clear_log(self):
         self.txt.delete("1.0", "end")
 
-    def clear_report(self):
-        for iid in self.report_tree.get_children():
-            self.report_tree.delete(iid)
-        if hasattr(self, "_row_sort_keys"):
-            self._row_sort_keys.clear()
-        self.btn_save_report.config(state="disabled")
-        self.btn_clear_report.config(state="disabled")
-
-    def _show_tree_menu(self, event):
-        iid = self.report_tree.identify_row(event.y)
-        if iid:
-            if iid not in self.report_tree.selection():
-                self.report_tree.selection_set(iid)
-        try:
-            self.tree_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.tree_menu.grab_release()
-
-    def _copy_row(self):
-        sel = self.report_tree.selection()
-        if not sel:
-            return
-        iid = sel[0]
-        values = self.report_tree.item(iid, "values")
-        text = "\t".join(str(v) for v in values)
-        self.clipboard_clear()
-        self.clipboard_append(text)
-
-    def _copy_all(self):
-        rows = []
-        for iid in self.report_tree.get_children():
-            rows.append("\t".join(str(v) for v in self.report_tree.item(iid, "values")))
-        text = "\n".join(rows)
-        self.clipboard_clear()
-        self.clipboard_append(text)
-
-    def _sort_tree(self, col):
-        children = list(self.report_tree.get_children(""))
-        sort_keys = getattr(self, "_row_sort_keys", {})
-        def key_for(iid):
-            v = sort_keys.get(iid, {}).get(col)
-            if v is None:
-                # Fall back to displayed text
-                try:
-                    return float(str(self.report_tree.set(iid, col)).rstrip("%"))
-                except ValueError:
-                    return str(self.report_tree.set(iid, col)).casefold()
-            if isinstance(v, (int, float)):
-                return v
-            return str(v).casefold()
-        rows = sorted(children, key=key_for)
-        for index, iid in enumerate(rows):
-            self.report_tree.move(iid, "", index)
-        # Re-apply zebra striping after reorder
-        for index, iid in enumerate(self.report_tree.get_children("")):
-            tag = "evenrow" if index % 2 == 0 else "oddrow"
-            current = self.report_tree.item(iid, "tags")
-            if current != (tag,):
-                self.report_tree.item(iid, tags=(tag,))
-
-    def save_report_csv(self):
-        if not self.report_tree.get_children():
-            messagebox.showinfo("Info", "No report data to save. Run 'Show Status' first.")
-            return
-        path = filedialog.asksaveasfilename(
-            title="Save Report as CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["Status", "Algorithm", "Size", "On Disk", "Savings %", "File Path"])
-                for iid in self.report_tree.get_children(""):
-                    writer.writerow(self.report_tree.item(iid, "values"))
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save report:\n{e}")
-            return
-        messagebox.showinfo("Saved", f"Report saved to:\n{path}")
-
     def _disable_actions(self):
         self.btn_status.config(state="disabled")
         self.btn_compress.config(state="disabled")
@@ -728,7 +658,7 @@ class App(tk.Tk):
         self.btn_stop.config(state="disabled")
         self.alg_combo.config(state="readonly")
         self.beh_combo.config(state="readonly")
-        if self.report_tree.get_children():
+        if self.status_tree.get_children():
             self.btn_save_report.config(state="normal")
             self.btn_clear_report.config(state="normal")
 
@@ -744,11 +674,13 @@ class App(tk.Tk):
                         break
                 except queue.Empty:
                     break
-            
+
             if messages:
                 self.append_log_batch(messages)
 
             latest_progress = None
+            status_rows = []
+            status_clear = False
             while True:
                 try:
                     action, value = self.ui_q.get_nowait()
@@ -764,37 +696,19 @@ class App(tk.Tk):
                 elif action == "size":
                     self.size_label.config(text=value)
                 elif action == "status_row":
-                    # value = (status, alg, size_text, ondisk_text, pct_num, path, orig, ondisk)
-                    status_v, alg_v, size_v, ondisk_v, pct_v, path_v, orig_v, ondisk_bytes_v = value
-                    pct_display = f"{pct_v}%" if pct_v not in ("", "?") else pct_v
-                    # Stash numeric bytes via a private attribute on the item for sort
-                    iid = self.report_tree.insert(
-                        "",
-                        "end",
-                        values=(status_v, alg_v, size_v, ondisk_v, pct_display, path_v),
-                    )
-                    # Zebra striping based on current visible row count
-                    children = self.report_tree.get_children("")
-                    row_index = children.index(iid)
-                    tag = "evenrow" if row_index % 2 == 0 else "oddrow"
-                    self.report_tree.item(iid, tags=(tag,))
-                    # Store raw numeric sort keys in a parallel dict
-                    if not hasattr(self, "_row_sort_keys"):
-                        self._row_sort_keys = {}
-                    self._row_sort_keys[iid] = {
-                        "status": status_v,
-                        "algorithm": alg_v,
-                        "size": orig_v,
-                        "ondisk": ondisk_bytes_v,
-                        "savings": float(pct_v) if pct_v not in ("", "?") else 0.0,
-                        "path": path_v,
-                    }
-                    # Enable Save/Clear once we have at least one row
-                    self.btn_save_report.config(state="normal")
-                    self.btn_clear_report.config(state="normal")
+                    status_rows.append(value)
+                    if len(status_rows) >= 500:
+                        self._add_status_rows(status_rows)
+                        status_rows = []
+                elif action == "status_clear":
+                    status_clear = True
+            if status_clear:
+                self._clear_status_report()
+            if status_rows:
+                self._add_status_rows(status_rows)
             if latest_progress is not None:
                 self.progress["value"] = latest_progress
-                
+
         except Exception:
             pass
         finally:
@@ -833,6 +747,147 @@ class App(tk.Tk):
         self.stop_flag.set()
 
     # -------------
+    # Status report (Treeview) helpers
+    # -------------
+    def _clear_status_report(self):
+        for iid in self.status_tree.get_children(""):
+            self.status_tree.delete(iid)
+        self._status_raw.clear()
+        self._status_sort_state.clear()
+        self._status_row_count = 0
+        self.btn_save_report.config(state="disabled")
+        self.btn_clear_report.config(state="disabled")
+
+    def _add_status_rows(self, rows):
+        for row in rows:
+            iid = str(self._status_row_count)
+            self._status_row_count += 1
+            tag = "evenrow" if (self._status_row_count % 2 == 0) else "oddrow"
+            values = (
+                row.get("status", ""),
+                row.get("algorithm", ""),
+                row.get("size_disp", ""),
+                row.get("ondisk_disp", ""),
+                row.get("savings_disp", ""),
+                row.get("path", ""),
+            )
+            self.status_tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+            # Store raw values for sorting
+            self._status_raw[iid] = {
+                "status":    row.get("status", ""),
+                "algorithm": row.get("algorithm", ""),
+                "size":      row.get("size_raw", -1),
+                "ondisk":    row.get("ondisk_raw", -1),
+                "savings":   row.get("savings_raw", -1.0),
+                "path":      row.get("path_raw", row.get("path", "").casefold()),
+            }
+        # Enable Save/Clear once we have at least one row
+        if rows:
+            self.btn_save_report.config(state="normal")
+            self.btn_clear_report.config(state="normal")
+
+    def _sort_status(self, col):
+        if not self._status_raw:
+            return
+        raw = self._status_raw
+        prev = self._status_sort_state.get(col)
+        if prev is None:
+            reverse = False
+            self._status_sort_state[col] = "asc"
+        elif prev == "asc":
+            reverse = True
+            self._status_sort_state[col] = "desc"
+        else:
+            reverse = False
+            self._status_sort_state[col] = "asc"
+
+        def sort_key(iid):
+            v = raw[iid].get(col)
+            if v is None:
+                return (1, 0)
+            if isinstance(v, bool):
+                return (0, int(v))
+            if isinstance(v, (int, float)):
+                return (0, v)
+            return (0, str(v).lower())
+
+        items = list(self.status_tree.get_children(""))
+        items.sort(key=sort_key, reverse=reverse)
+        for idx, iid in enumerate(items):
+            self.status_tree.move(iid, "", idx)
+        self._apply_zebra()
+        # Update heading to show direction indicator
+        for c in STATUS_COL_IDS:
+            label = STATUS_COL_HEADINGS[c]
+            if c == col:
+                indicator = " ▲" if not reverse else " ▼"
+                self.status_tree.heading(c, text=label + indicator)
+            else:
+                self.status_tree.heading(c, text=label)
+
+    def _apply_zebra(self):
+        for idx, iid in enumerate(self.status_tree.get_children("")):
+            tag = "evenrow" if (idx % 2 == 0) else "oddrow"
+            self.status_tree.item(iid, tags=(tag,))
+
+    def on_clear_report(self):
+        self._clear_status_report()
+
+    def on_save_report(self):
+        items = self.status_tree.get_children("")
+        if not items:
+            messagebox.showinfo("Save Report", "There is no status report to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Status Report",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([STATUS_COL_HEADINGS[c] for c in STATUS_COL_IDS])
+                for iid in items:
+                    writer.writerow([self.status_tree.set(iid, c) for c in STATUS_COL_IDS])
+        except Exception as e:
+            messagebox.showerror("Save Report", f"Failed to save report: {e}")
+            return
+        messagebox.showinfo("Save Report", f"Report saved to:\n{path}")
+
+    def _show_status_menu(self, event):
+        iid = self.status_tree.identify_row(event.y)
+        if iid:
+            if iid not in self.status_tree.selection():
+                self.status_tree.selection_set(iid)
+            self.status_tree.focus(iid)
+        try:
+            self.status_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.status_menu.grab_release()
+
+    def _copy_status_row(self):
+        sel = self.status_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        row = "\t".join(self.status_tree.set(iid, c) for c in STATUS_COL_IDS)
+        self.clipboard_clear()
+        self.clipboard_append(row)
+        self.update()  # keep clipboard content after window closes
+
+    def _copy_status_all(self):
+        lines = ["\t".join(STATUS_COL_HEADINGS[c] for c in STATUS_COL_IDS)]
+        for iid in self.status_tree.get_children(""):
+            lines.append("\t".join(self.status_tree.set(iid, c) for c in STATUS_COL_IDS))
+        if len(lines) == 1:
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        self.update()
+
+    # -------------
     # Operations
     # -------------
     def on_status(self):
@@ -844,14 +899,11 @@ class App(tk.Tk):
             messagebox.showerror("Error", "Folder not found.")
             return
 
-        # Clear the Treeview (status report) and switch to that tab for live population.
-        self.clear_report()
+        self.ui_q.put(("status_clear", None))
         try:
-            self.notebook.select(self.report_frame)
+            self.notebook.select(0)
         except Exception:
             pass
-        self.clear_log()
-        self.append_log("Starting status scan...")
         self.stop_flag.clear()
         self._disable_actions()
 
@@ -863,14 +915,25 @@ class App(tk.Tk):
 
                 for idx, path in enumerate(files, 1):
                     if self.stop_flag.is_set():
-                        self.log_q.put("[Stopped]")
                         break
 
                     try:
                         # Algorithm
                         alg = get_compression_algorithm(path)
                         if alg is None:
-                            self.log_q.put(f"[Error: Access denied] {path}")
+                            # Access denied - record an error row
+                            self.ui_q.put(("status_row", {
+                                "status":    "Error",
+                                "algorithm": "-",
+                                "size_disp": "?",
+                                "size_raw":  -1,
+                                "ondisk_disp": "?",
+                                "ondisk_raw": -1,
+                                "savings_disp": "?",
+                                "savings_raw": -1.0,
+                                "path":      path,
+                                "path_raw":  path.casefold(),
+                            }))
                             self.ui_q.put(("progress", idx))
                             continue
 
@@ -884,31 +947,43 @@ class App(tk.Tk):
                         # Status
                         status = "Compressed" if (alg != "-" and alg is not None) else "Uncompressed"
 
-                        size_text = fmt_bytes(orig) if orig is not None else "?"
-                        ondisk_text = fmt_bytes(ondisk) if ondisk is not None else "?"
-                        pct_text = percent_saving(orig, ondisk)
-                        # pct_text looks like "12%"; strip "%" for sort-friendly storage,
-                        # but display with "%". Keep raw number in iid metadata via tags.
-                        pct_num = ""
-                        if pct_text.endswith("%") and pct_text != "?":
-                            try:
-                                pct_num = pct_text.rstrip("%")
-                            except Exception:
-                                pct_num = pct_text
+                        # Savings raw value (used for sorting)
+                        savings_raw = -1.0
+                        if orig is not None and ondisk is not None and orig > 0:
+                            if ondisk < orig:
+                                savings_raw = (1.0 - (ondisk / orig)) * 100.0
+                            else:
+                                savings_raw = 0.0
 
-                        # Numeric bytes (for sort): keep as separate column? We use displayed
-                        # text for display and a small raw-bytes sort helper. For simplicity
-                        # we sort by displayed text but allow parsing back to numbers.
-                        # We pass structured fields via ui_q.
-                        self.ui_q.put((
-                            "status_row",
-                            (status, alg, size_text, ondisk_text, pct_num, path,
-                             orig if orig is not None else -1,
-                             ondisk if ondisk is not None else -1),
-                        ))
+                        size_raw = orig if orig is not None else -1
+                        ondisk_raw = ondisk if ondisk is not None else -1
+
+                        self.ui_q.put(("status_row", {
+                            "status":      status,
+                            "algorithm":   alg if alg is not None else "-",
+                            "size_disp":   fmt_bytes(orig),
+                            "size_raw":    size_raw,
+                            "ondisk_disp": fmt_bytes(ondisk),
+                            "ondisk_raw":  ondisk_raw,
+                            "savings_disp": percent_saving(orig, ondisk),
+                            "savings_raw": savings_raw,
+                            "path":        path,
+                            "path_raw":    path.casefold(),
+                        }))
 
                     except Exception as e:
-                        self.log_q.put(f"[Error: {e}] {path}")
+                        self.ui_q.put(("status_row", {
+                            "status":      "Error",
+                            "algorithm":   "-",
+                            "size_disp":   "?",
+                            "size_raw":    -1,
+                            "ondisk_disp": "?",
+                            "ondisk_raw":  -1,
+                            "savings_disp": "?",
+                            "savings_raw": -1.0,
+                            "path":        f"[Error: {e}] {path}",
+                            "path_raw":    path.casefold(),
+                        }))
 
                     self.ui_q.put(("progress", idx))
 
@@ -947,13 +1022,13 @@ class App(tk.Tk):
 
         self.clear_log()
         self.append_log(f"Starting compression → Algorithm: {alg_label}, Behavior: {beh_label}")
-        self.stop_flag.clear()
-        self._disable_actions()
         # Switch to the compression log tab so streaming output is visible.
         try:
-            self.notebook.select(self.log_frame)
+            self.notebook.select(1)
         except Exception:
             pass
+        self.stop_flag.clear()
+        self._disable_actions()
         
         def worker():
             try:
