@@ -28,7 +28,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import re
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.5.0"
 
 # -------------------------
 # Windows API — size and attribute helpers
