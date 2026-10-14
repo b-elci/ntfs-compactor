@@ -166,11 +166,16 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as exc:
+        details = str(exc)
+        for filename in ('tests.log', 'native.log'):
+            log = ROOT / 'build' / 'release-validation' / filename
+            if log.exists():
+                details += '\n' + filename + ':\n' + log.read_text(encoding='utf-8')[-4000:]
+        annotation = details.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+        print('::error title=Windows release validation::' + annotation, flush=True)
         summary = os.environ.get('GITHUB_STEP_SUMMARY')
         if summary:
             with open(summary, 'a', encoding='utf-8') as output:
                 output.write('# Windows release validation failed\n\n' + str(exc) + '\n')
-                native_log = ROOT / 'build' / 'release-validation' / 'native.log'
-                if native_log.exists():
-                    output.write('\n```text\n' + native_log.read_text(encoding='utf-8')[-6000:] + '\n```\n')
+                output.write('\n```text\n' + details + '\n```\n')
         raise
