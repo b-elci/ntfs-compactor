@@ -424,12 +424,14 @@ def register_context_menu(remove=False):
                                 ('NTFSCompactor.Owner', 'NTFSCompactor')):
                 winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
         placeholder = '%V' if '\\Background\\' in root else '%1'
+        # The trailing dot keeps a drive root's backslash from escaping the quote.
+        target_argument = placeholder if root.startswith(r'Software\Classes\*') else placeholder + r'\.'
         for action, label in (('scan', 'Show status'), ('compress', 'Compress'), ('decompress', 'Decompress')):
             entry = root + '\\shell\\' + action
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, entry) as key:
                 winreg.SetValueEx(key, '', 0, winreg.REG_SZ, label)
             with winreg.CreateKey(winreg.HKEY_CURRENT_USER, entry + r'\command') as key:
-                command = subprocess.list2cmdline(launch_command()) + ' --action ' + action + ' "' + placeholder + '"'
+                command = subprocess.list2cmdline(launch_command()) + ' --action ' + action + ' "' + target_argument + '"'
                 winreg.SetValueEx(key, '', 0, winreg.REG_SZ, command)
 
 

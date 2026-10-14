@@ -458,7 +458,8 @@ class ShellIntegrationTests(unittest.TestCase):
             self.assertEqual(len(commands), 9)
             for path, command in commands.items():
                 self.assertTrue(command.startswith('"C:\\App Folder\\NTFS.exe" --action '))
-                self.assertTrue(command.endswith('"%V"' if '\\Background\\' in path else '"%1"'))
+                ending = '"%1"' if path.startswith(r'Software\Classes\*') else '"%V\\."' if '\\Background\\' in path else '"%1\\."'
+                self.assertTrue(command.endswith(ending))
             compactor.register_context_menu(remove=True)
         self.assertEqual(registry.keys, {})
 

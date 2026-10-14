@@ -109,7 +109,7 @@ def main():
         raise RuntimeError('Expected Windows folder distribution is missing')
     if args.certificate_thumbprint:
         sign(executable, args.certificate_thumbprint, args.timestamp_url)
-    run([str(python), str(ROOT / 'scripts' / 'smoke_windows.py'), '--exe', str(executable), '--report', str(reports / 'native.json')])
+    run([str(python), str(ROOT / 'scripts' / 'smoke_windows.py'), '--exe', str(executable), '--report', str(reports / 'native.json')], reports / 'native.log')
     shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
     shutil.copy2(ROOT / 'release' / 'README.txt', package / 'README.txt')
     for script in ('Install-context-menu.cmd', 'Remove-context-menu.cmd'):
@@ -163,4 +163,14 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        summary = os.environ.get('GITHUB_STEP_SUMMARY')
+        if summary:
+            with open(summary, 'a', encoding='utf-8') as output:
+                output.write('# Windows release validation failed\n\n' + str(exc) + '\n')
+                native_log = ROOT / 'build' / 'release-validation' / 'native.log'
+                if native_log.exists():
+                    output.write('\n```text\n' + native_log.read_text(encoding='utf-8')[-6000:] + '\n```\n')
+        raise
