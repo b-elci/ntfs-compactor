@@ -29,6 +29,9 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
   - Balanced defaults: XPRESS8K and skip files that are already compressed
   - Exclude extensions and folders using optional patterns
   - Remove compression with the Decompress action
+  - Skip files at most one actual volume cluster and known compressed formats
+  - Remember verified no-benefit files until they change
+  - Optional per-user Explorer right-click actions for files and folders
   - Verbose logging toggle for detailed output control
 
 - 💻 **User-Friendly Interface**
@@ -112,6 +115,21 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
   by `;`, for example `cache; node_modules; backups/*`. Matching folders are
   pruned before their contents are scanned. Directory symlinks and junctions
   are not followed; file symlinks are skipped.
+- **Smart filtering** is enabled by default for compression. It uses the selected
+  volume's actual cluster size, skips files no larger than one cluster and common
+  compressed formats (JPEG/PNG, MP4/MP3/OGG, ZIP/7z, etc.). These format rules are
+  heuristics; disable the option when you deliberately want to try these files.
+  It does not filter status scans or decompression.
+- Verified Windows no-benefit outcomes are cached per algorithm under
+  `%LOCALAPPDATA%\NTFSCompactor\no-gain.sqlite`. Size, write time, and NTFS change
+  time invalidate cached outcomes after edits, including edits preserving write
+  timestamps. The cache does not estimate compressibility by reading entire files.
+- **Tools > Choose file** targets a single file; its siblings are not processed.
+- **Tools > Install Explorer menu** installs per-user Show status, Compress, and
+  Decompress actions for files, directories, and directory backgrounds. Removal
+  is available in the same menu. No administrator rights are needed to install
+  these HKCU entries. On Windows 11, use **Show more options**. Reinstall after
+  moving the program folder. The ZIP also includes install/remove `.cmd` helpers.
 - Filters apply to status, compression, decompression, and size measurements.
   Before/after totals describe matching files rather than excluded content.
 - Folder, filter, and algorithm controls are locked for the duration of an
@@ -123,6 +141,9 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
   may finish before cancellation is observed. Cancelled runs skip the final
   full size measurement. An interrupted run may have changed some files;
   run Show Status to inspect their final state.
+- Extended paths unsupported by `compact.exe` use a separate cancellable helper
+  process calling the documented Windows WOF/NTFS APIs. Windows no-benefit results
+  are counted as skipped, rather than repeatedly treated as compression errors.
 - Throughput represents logical bytes processed, including failed attempts that
   reached a final outcome. ETA is approximate and depends on file sizes and
   compressibility. It is not a benchmark of the compression algorithm.

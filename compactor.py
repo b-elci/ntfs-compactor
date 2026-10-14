@@ -33,6 +33,7 @@ import json
 import sqlite3
 import fnmatch
 import locale
+import argparse
 
 APP_VERSION = "1.6.0"
 
@@ -102,6 +103,99 @@ def check_volume(folder):
     if not api(root.value, None, 0, None, None, None, fs, len(fs)):
         raise OSError(ctypes.get_last_error(), "Cannot read volume information")
     return fs.value
+
+
+def get_cluster_size(target):
+    root = ctypes.create_unicode_buffer(32768)
+    api = kernel32.GetVolumePathNameW
+    api.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    api.restype = wintypes.BOOL
+    if not api(windows_path(target), root, len(root)):
+        raise OSError(ctypes.get_last_error(), "Cannot determine the selected volume")
+    sectors, bytes_per_sector, free, total = (wintypes.DWORD() for _ in range(4))
+    api = kernel32.GetDiskFreeSpaceW
+    api.argtypes = [wintypes.LPCWSTR] + [ctypes.POINTER(wintypes.DWORD)] * 4
+    api.restype = wintypes.BOOL
+    if not api(root.value, ctypes.byref(sectors), ctypes.byref(bytes_per_sector), ctypes.byref(free), ctypes.byref(total)):
+        raise OSError(ctypes.get_last_error(), "Cannot read volume cluster size")
+    size = sectors.value * bytes_per_sector.value
+    if size <= 0:
+        raise OSError("Invalid volume cluster size")
+    return size
+
+
+COMPRESSED_FORMATS = frozenset((
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.heic',
+    '.mp4', '.mkv', '.webm', '.mov', '.avi', '.mp3', '.ogg', '.flac', '.aac',
+    '.zip', '.7z', '.rar', '.gz', '.bz2', '.xz', '.zst', '.cab', '.wim',
+))
+
+
+def smart_skip_reason(path, size, cluster_size):
+    if size <= cluster_size:
+        return 'at most one disk cluster'
+    if os.path.splitext(path)[1].casefold() in COMPRESSED_FORMATS:
+        return 'already compressed file format'
+    return None
+
+
+class NoGainCache:
+    """Remember only verified no-benefit outcomes, keyed by content metadata."""
+    def __init__(self, path=None):
+        if path is None:
+            root = os.environ.get('LOCALAPPDATA') if os.name == 'nt' else None
+            path = os.path.join(root or tempfile.gettempdir(), 'NTFSCompactor', 'no-gain.sqlite')
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.db = sqlite3.connect(path)
+        self.db.execute('CREATE TABLE IF NOT EXISTS no_gain (path TEXT, algorithm TEXT, size INTEGER, mtime INTEGER, ctime INTEGER, PRIMARY KEY(path, algorithm))')
+
+    def fingerprint(self, path):
+        info = os.stat(path)
+        changed = file_change_time(path) if os.name == 'nt' else info.st_ctime_ns
+        return info.st_size, info.st_mtime_ns, changed
+
+    def contains(self, path, algorithm):
+        record = self.db.execute('SELECT size,mtime,ctime FROM no_gain WHERE path=? AND algorithm=?',
+            (os.path.normcase(os.path.abspath(path)), algorithm)).fetchone()
+        return record is not None and tuple(record) == self.fingerprint(path)
+
+    def add(self, path, algorithm):
+        values = self.fingerprint(path)
+        self.db.execute('INSERT OR REPLACE INTO no_gain VALUES (?,?,?,?,?)',
+            (os.path.normcase(os.path.abspath(path)), algorithm, *values))
+        self.db.commit()
+
+    def close(self):
+        self.db.close()
+
+
+def file_change_time(path):
+    # Windows st_ctime is creation time on older Python releases. NTFS ChangeTime
+    # catches content replacements even when an updater preserves LastWriteTime.
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [('created', ctypes.c_int64), ('accessed', ctypes.c_int64),
+                    ('written', ctypes.c_int64), ('changed', ctypes.c_int64),
+                    ('attributes', wintypes.DWORD)]
+    create = kernel32.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    handle = create(windows_path(path), 0x80, 7, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), 'Cannot read file change time')
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    try:
+        api = kernel32.GetFileInformationByHandleEx
+        api.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        api.restype = wintypes.BOOL
+        info = BasicInfo()
+        if not api(handle, 0, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), 'Cannot read file change time')
+        return info.changed
+    finally:
+        close(handle)
 
 
 def check_write_access(folder):
@@ -227,6 +321,118 @@ def get_compression_algorithm(path):
 # compact.exe helpers
 # -------------------------
 
+def native_file_operation(path, operation, algorithm):
+    """Use documented WOF/NTFS APIs when compact.exe cannot handle a path."""
+    current = get_compression_algorithm(path)
+    if current is None:
+        raise OSError("Cannot read compression state: " + path)
+    create = kernel32.CreateFileW
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create.restype = wintypes.HANDLE
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    handle = create(windows_path(path), 0xC0000000, 7, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise OSError(ctypes.get_last_error(), "Cannot open " + path)
+    try:
+        control = kernel32.DeviceIoControl
+        control.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+        control.restype = wintypes.BOOL
+        returned = wintypes.DWORD()
+        if current in WOF_ALGORITHMS.values():
+            # FSCTL_DELETE_EXTERNAL_BACKING reads/decompresses the file in place.
+            if not control(handle, 0x00090314, None, 0, None, 0, ctypes.byref(returned), None):
+                raise OSError(ctypes.get_last_error(), "Cannot remove WOF backing")
+        elif current == 'LZNT1/Unknown':
+            uncompressed = ctypes.c_ushort(0)
+            if not control(handle, 0x0009C040, ctypes.byref(uncompressed), 2, None, 0, ctypes.byref(returned), None):
+                raise OSError(ctypes.get_last_error(), "Cannot remove NTFS compression")
+        elif current != '-':
+            raise OSError("Unsupported external backing provider")
+        if operation == 'decompress':
+            return {'status': 'passed'}
+        if wofutil is None:
+            raise OSError("Wofutil.dll is unavailable")
+        algorithms = {name.casefold(): number for number, name in WOF_ALGORITHMS.items()}
+        info = WofFileCompressionInfo(algorithms[algorithm], 0)
+        api = wofutil.WofSetFileDataLocation
+        api.argtypes = [wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG]
+        api.restype = wintypes.LONG
+        result = api(handle, WOF_PROVIDER_FILE, ctypes.byref(info), ctypes.sizeof(info))
+        if result & 0xFFFFFFFF == 0x80070158:  # ERROR_COMPRESSION_NOT_BENEFICIAL
+            if current in WOF_ALGORITHMS.values():
+                previous = WofFileCompressionInfo(algorithms[current.casefold()], 0)
+                restored = api(handle, WOF_PROVIDER_FILE, ctypes.byref(previous), ctypes.sizeof(previous))
+                if restored != 0:
+                    raise OSError('No benefit from new algorithm; original compression could not be restored')
+            return {'status': 'skipped', 'reason': 'no-benefit'}
+        if result != 0:
+            raise OSError("WOF compression failed: HRESULT 0x%08X" % (result & 0xFFFFFFFF))
+        return {'status': 'passed'}
+    finally:
+        close(handle)
+
+
+def launch_command():
+    if getattr(sys, 'frozen', False):
+        return [sys.executable]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
+def needs_native_path(path):
+    return os.name == 'nt' and len(os.path.abspath(path)) >= 260
+
+
+def register_context_menu(remove=False):
+    import winreg
+    roots = (r'Software\Classes\Directory\shell\NTFSCompactor',
+             r'Software\Classes\Directory\Background\shell\NTFSCompactor',
+             r'Software\Classes\*\shell\NTFSCompactor')
+    def delete_tree(path):
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            while True:
+                try:
+                    name = winreg.EnumKey(key, 0)
+                except OSError as exc:
+                    if getattr(exc, 'winerror', exc.errno) != 259:
+                        raise
+                    break
+                delete_tree(path + '\\' + name)
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+    for root in roots:
+        try:
+            existing = winreg.OpenKey(winreg.HKEY_CURRENT_USER, root)
+        except FileNotFoundError:
+            if remove:
+                continue
+        else:
+            with existing as key:
+                try:
+                    owner, _ = winreg.QueryValueEx(key, 'NTFSCompactor.Owner')
+                except FileNotFoundError:
+                    raise ValueError('An unowned context menu already uses this key')
+                if owner != 'NTFSCompactor':
+                    raise ValueError('An unrelated context menu already uses this key')
+        if remove:
+            delete_tree(root)
+            continue
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root) as key:
+            for name, value in (('MUIVerb', 'NTFS Compactor'), ('SubCommands', ''),
+                                ('NTFSCompactor.Owner', 'NTFSCompactor')):
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        placeholder = '%V' if '\\Background\\' in root else '%1'
+        for action, label in (('scan', 'Show status'), ('compress', 'Compress'), ('decompress', 'Decompress')):
+            entry = root + '\\shell\\' + action
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, entry) as key:
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, label)
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, entry + r'\command') as key:
+                command = subprocess.list2cmdline(launch_command()) + ' --action ' + action + ' "' + placeholder + '"'
+                winreg.SetValueEx(key, '', 0, winreg.REG_SZ, command)
+
+
 def run_compact(args, cwd=None):
     cmd = [compact_executable()] + args
     try:
@@ -255,7 +461,7 @@ def compact_compress_file(path, algorithm_switch, force=False):
     return run_compact(args)
 
 def run_compact_stream(args, files, callback_line, stop_event=None,
-                       progress_callback=None, verify=None, result_callback=None):
+                       progress_callback=None, verify=None, result_callback=None, skip_callback=None):
     """Run adaptive batches with cancellable pipe reads and explicit outcomes.
 
     files may be an iterator of paths or (path, logical_size) pairs.
@@ -276,12 +482,26 @@ def run_compact_stream(args, files, callback_line, stop_event=None,
         if result_callback:
             result_callback(dict(stats))
 
-    def execute(entries, directory, grow=True):
+    def execute(entries, directory, grow=True, native=False):
         nonlocal batch_limit, growth_cooldown
         if stop_event.is_set():
             stats["cancelled"] += len(entries)
             return
-        cmd = base_cmd + [os.path.basename(path) for path, _ in entries]
+        use_native = native or any(needs_native_path(path) for path, _ in entries)
+        if use_native and len(entries) > 1:
+            for entry in entries:
+                execute([entry], directory, grow=False, native=True)
+            return
+        helper_report = None
+        if use_native:
+            fd, helper_report = tempfile.mkstemp(prefix='ntfs-native-', suffix='.json')
+            os.close(fd)
+            algorithm = next((arg.split(':', 1)[1] for arg in args if arg.lower().startswith('/exe:')), 'xpress8k')
+            operation = 'decompress' if '/u' in args else 'compress'
+            cmd = launch_command() + ['--native-file-op', operation, '--algorithm', algorithm,
+                                      '--result', helper_report, entries[0][0]]
+        else:
+            cmd = base_cmd + [os.path.basename(path) for path, _ in entries]
         output = queue.Queue(maxsize=256)
         reader_done = threading.Event()
         reader_errors = []
@@ -293,7 +513,7 @@ def run_compact_stream(args, files, callback_line, stop_event=None,
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, encoding=compact_output_encoding(),
                 errors="replace", creationflags=0x08000000, bufsize=1,
-                cwd=windows_path(directory))
+                cwd=os.path.dirname(sys.executable) if use_native else windows_path(directory))
 
             def read_output():
                 try:
@@ -341,6 +561,17 @@ def run_compact_stream(args, files, callback_line, stop_event=None,
             if cancelled or stop_event.is_set():
                 stats["cancelled"] += len(entries)
                 return
+            if helper_report:
+                with open(helper_report, encoding='utf-8') as report:
+                    outcome = json.load(report)
+                if outcome.get('status') == 'skipped' and code == 0:
+                    record('skipped', entries)
+                    callback_line('[Skipped] No disk-space benefit: ' + entries[0][0])
+                    if skip_callback:
+                        skip_callback(entries[0][0], outcome.get('reason'))
+                    return
+                if outcome.get('status') != 'passed':
+                    callback_line('[Error] ' + outcome.get('error', 'Native operation failed'))
             succeeded, failed = [], []
             for entry in entries:
                 try:
@@ -357,6 +588,8 @@ def run_compact_stream(args, files, callback_line, stop_event=None,
                 execute(failed[:middle], directory, grow=False)
                 if failed[middle:]:
                     execute(failed[middle:], directory, grow=False)
+            elif failed and not use_native and verify is not None and os.name == 'nt':
+                execute(failed, directory, grow=False, native=True)
             elif failed:
                 record("failed", failed)
                 callback_line("[Error] Failed: %s (exit %s) %s" %
@@ -373,6 +606,11 @@ def run_compact_stream(args, files, callback_line, stop_event=None,
                 record("failed", entries)
                 callback_line("[Error] Batch failed: %s" % exc)
         finally:
+            if helper_report:
+                try:
+                    os.unlink(helper_report)
+                except FileNotFoundError:
+                    pass
             if process is not None:
                 if process.poll() is None:
                     process.kill()
@@ -452,6 +690,15 @@ def iter_files_under(folder, excluded_extensions=(), excluded_folders=(),
                      stop_event=None, on_error=None):
     """Walk once, pruning exclusions and directory links/junctions."""
     root_folder = os.path.abspath(folder)
+    def extension_excluded(name):
+        return any(fnmatch.fnmatchcase(name.casefold(),
+                    pattern if '*' in pattern or '?' in pattern else '*' +
+                    (pattern if pattern.startswith('.') else '.' + pattern))
+                   for pattern in excluded_extensions)
+    if os.path.isfile(root_folder):
+        if not (stop_event and stop_event.is_set()) and not os.path.islink(root_folder) and not extension_excluded(os.path.basename(root_folder)):
+            yield root_folder
+        return
     def walk_error(exc):
         if on_error:
             on_error(exc)
@@ -473,10 +720,7 @@ def iter_files_under(folder, excluded_extensions=(), excluded_folders=(),
         for name in files:
             if stop_event and stop_event.is_set():
                 return
-            if any(fnmatch.fnmatchcase(name.casefold(),
-                        pattern if "*" in pattern or "?" in pattern else "*" +
-                        (pattern if pattern.startswith(".") else "." + pattern))
-                   for pattern in excluded_extensions):
+            if extension_excluded(name):
                 continue
             path = os.path.join(root, name)
             if not os.path.islink(path):
@@ -488,7 +732,7 @@ def scan_files(folder, excluded_extensions=(), excluded_folders=(),
     for path in iter_files_under(folder, excluded_extensions, excluded_folders,
                                  stop_event, on_error):
         try:
-            size = os.path.getsize(path)
+            size = os.stat(path).st_size
             disk = get_size_on_disk(path)
             algorithm = get_compression_algorithm(path)
             if disk is None or algorithm is None:
@@ -570,7 +814,7 @@ class App(tk.Tk):
         top.pack(fill="x", pady=(0,8))
 
         # Left side: folder controls
-        ttk.Label(top, text="Folder:").pack(side="left")
+        ttk.Label(top, text="Target:").pack(side="left")
         self.ent_folder = ttk.Entry(top, textvariable=self.folder, width=70)
         self.ent_folder.pack(side="left", padx=6)
         self.btn_browse = ttk.Button(top, text="Browse...", command=self.choose_folder)
@@ -608,12 +852,23 @@ class App(tk.Tk):
         filters.pack(fill="x", pady=(0, 8))
         self.exclude_extensions = tk.StringVar()
         self.exclude_folders = tk.StringVar()
+        self.smart_filter = tk.BooleanVar(value=True)
         ttk.Label(filters, text="Exclude extensions (;):").pack(side="left")
         self.ext_entry = ttk.Entry(filters, textvariable=self.exclude_extensions, width=24)
         self.ext_entry.pack(side="left", padx=6)
         ttk.Label(filters, text="Exclude folders (;):").pack(side="left")
         self.exclude_entry = ttk.Entry(filters, textvariable=self.exclude_folders, width=30)
         self.exclude_entry.pack(side="left", padx=6)
+        self.smart_check = ttk.Checkbutton(filters, text="Smart filtering", variable=self.smart_filter)
+        self.smart_check.pack(side="left", padx=8)
+        menu = tk.Menu(self)
+        tools = tk.Menu(menu, tearoff=False)
+        tools.add_command(label="Choose file...", command=self.choose_file)
+        tools.add_separator()
+        tools.add_command(label="Install Explorer menu", command=lambda: self.configure_shell(False))
+        tools.add_command(label="Remove Explorer menu", command=lambda: self.configure_shell(True))
+        menu.add_cascade(label="Tools", menu=tools)
+        self.config(menu=menu)
         self.metrics_label = ttk.Label(frm, text="Ready")
         self.metrics_label.pack(fill="x", pady=(0, 6))
 
@@ -736,6 +991,26 @@ class App(tk.Tk):
             self.before_disk = None
             self.size_label.config(text="Measurement will be done during compression")
 
+    def choose_file(self):
+        if self._busy:
+            return
+        path = filedialog.askopenfilename()
+        if path:
+            self.folder.set(path)
+            self.size_label.config(text="Measurement will be done during the operation")
+
+    def configure_shell(self, remove):
+        if self._busy:
+            return
+        try:
+            if os.name != 'nt':
+                raise OSError('Explorer integration requires Windows')
+            register_context_menu(remove=remove)
+        except Exception as exc:
+            messagebox.showerror('Explorer menu', str(exc))
+        else:
+            messagebox.showinfo('Explorer menu', 'Menu removed.' if remove else 'Menu installed for your account. On Windows 11, use Show more options.')
+
     def append_log(self, s):
         self.txt.insert("end", s + "\n")
         self.txt.see("end")
@@ -747,7 +1022,7 @@ class App(tk.Tk):
         self._busy = True
         for widget in (self.btn_status, self.btn_compress, self.btn_decompress,
                        self.btn_browse, self.ent_folder, self.ext_entry, self.exclude_entry,
-                       self.alg_combo, self.beh_combo, self.btn_clear_report):
+                       self.alg_combo, self.beh_combo, self.smart_check, self.btn_clear_report):
             widget.config(state="disabled")
         self.btn_stop.config(state="normal")
 
@@ -756,7 +1031,7 @@ class App(tk.Tk):
         self.progress.configure(mode="determinate")
         self._busy = False
         for widget in (self.btn_status, self.btn_compress, self.btn_decompress,
-                       self.btn_browse, self.ent_folder, self.ext_entry, self.exclude_entry):
+                       self.btn_browse, self.ent_folder, self.ext_entry, self.exclude_entry, self.smart_check):
             widget.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.alg_combo.config(state="readonly")
@@ -991,8 +1266,8 @@ class App(tk.Tk):
         folder = self.folder.get().strip()
         if self._busy:
             return
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("Warning", "Please select an existing folder.")
+        if not folder or not (os.path.isdir(folder) or os.path.isfile(folder)):
+            messagebox.showwarning("Warning", "Please select an existing file or folder.")
             return
         extensions, folders = self._filters()
         self._clear_status_report()
@@ -1038,13 +1313,14 @@ class App(tk.Tk):
         if self._busy:
             return
         folder = self.folder.get().strip()
-        if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("Warning", "Please select an existing folder.")
+        if not folder or not (os.path.isdir(folder) or os.path.isfile(folder)):
+            messagebox.showwarning("Warning", "Please select an existing file or folder.")
             return
         try:
             if check_volume(folder).upper() != "NTFS":
                 raise OSError("This operation requires an NTFS volume.")
-            check_write_access(folder)
+            check_write_access(os.path.dirname(folder) if os.path.isfile(folder) else folder)
+            cluster_size = get_cluster_size(folder) if self.smart_filter.get() and not decompress else 0
         except Exception as exc:
             messagebox.showerror("Cannot start", str(exc))
             return
@@ -1057,6 +1333,7 @@ class App(tk.Tk):
         if decompress and not messagebox.askyesno("Decompress", "Remove compression from matching files in this folder?"):
             return
         verbose = self.verbose.get()
+        smart = self.smart_filter.get() and not decompress
         self.clear_log()
         self.notebook.select(1)
         self.stop_flag.clear()
@@ -1070,11 +1347,17 @@ class App(tk.Tk):
             started = time.monotonic()
             last_update = 0
             stats = dict(successful=0, failed=0, skipped=0, cancelled=0, bytes=0)
+            cache = None
             def scan_error(exc):
                 nonlocal scan_errors
                 scan_errors += 1
                 self._send_log("[Error] " + str(exc))
             try:
+                if smart:
+                    try:
+                        cache = NoGainCache()
+                    except (OSError, sqlite3.Error) as exc:
+                        self._send_log('[Warning] No-benefit cache unavailable: ' + str(exc))
                 # Disk-backed operation plan avoids retaining every path in memory.
                 with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as plan:
                     self._send_ui("metrics", "Scanning matching files...")
@@ -1086,6 +1369,18 @@ class App(tk.Tk):
                         current = info["algorithm"]
                         needed = current != "-" if decompress else compression_action(
                             None if current == "-" else current, algorithm, behavior) != "skip"
+                        if needed and smart:
+                            reason = smart_skip_reason(info['path'], info['size'], cluster_size)
+                            if reason is None and cache is not None:
+                                try:
+                                    if cache.contains(info['path'], algorithm):
+                                        reason = 'unchanged file previously yielded no disk-space benefit'
+                                except (OSError, sqlite3.Error) as exc:
+                                    self._send_log('[Warning] Cannot read no-benefit cache: ' + str(exc))
+                            if reason:
+                                needed = False
+                                if verbose:
+                                    self._send_log('[Skipped] ' + reason + ': ' + info['path'])
                         if needed:
                             eligible += 1
                             eligible_bytes += info["size"]
@@ -1128,8 +1423,14 @@ class App(tk.Tk):
                     plan.seek(0)
                     files = (tuple(json.loads(line)) for line in plan)
                     args = ["/u", "/i", "/f"] if decompress else ["/c", "/i", "/f", "/exe:" + algorithm]
+                    def remember_skip(path, reason):
+                        if cache is not None and reason == 'no-benefit':
+                            try:
+                                cache.add(path, algorithm)
+                            except (OSError, sqlite3.Error) as exc:
+                                self._send_log('[Warning] Cannot cache no-benefit result: ' + str(exc))
                     stats = run_compact_stream(args, files, output, self.stop_flag,
-                        verify=verify, result_callback=metrics)
+                        verify=verify, result_callback=metrics, skip_callback=remember_skip)
                     metrics(stats, force=True)
                 cancelled = self.stop_flag.is_set()
                 # Invalidate the pre-operation report even if final measurement fails.
@@ -1168,13 +1469,47 @@ class App(tk.Tk):
                 self._send_log("[Error] Operation failed: " + str(exc))
                 self._send_ui("metrics", "Operation failed: " + str(exc))
             finally:
+                if cache is not None:
+                    cache.close()
                 self._send_ui("enable")
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
 if __name__ == "__main__":
-    if os.name != "nt":
-        messagebox.showerror("Error", "This tool only works on Windows.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description='NTFS Compactor')
+    parser.add_argument('target', nargs='?')
+    parser.add_argument('--action', choices=('scan', 'compress', 'decompress'), default='scan')
+    shell = parser.add_mutually_exclusive_group()
+    shell.add_argument('--install-context-menu', action='store_true')
+    shell.add_argument('--remove-context-menu', action='store_true')
+    parser.add_argument('--native-file-op', choices=('compress', 'decompress'), help=argparse.SUPPRESS)
+    parser.add_argument('--algorithm', choices=('xpress4k', 'xpress8k', 'xpress16k', 'lzx'), default='xpress8k', help=argparse.SUPPRESS)
+    parser.add_argument('--result', help=argparse.SUPPRESS)
+    options = parser.parse_args()
+    if options.native_file_op:
+        if not options.target or not options.result:
+            sys.exit(1)
+        try:
+            outcome = native_file_operation(options.target, options.native_file_op, options.algorithm)
+        except Exception as exc:
+            outcome = {'status': 'failed', 'error': str(exc)}
+        with open(options.result, 'w', encoding='utf-8') as report:
+            json.dump(outcome, report)
+        sys.exit(0 if outcome['status'] in ('passed', 'skipped') else 1)
+    if options.install_context_menu or options.remove_context_menu:
+        try:
+            register_context_menu(remove=options.remove_context_menu)
+            text = 'Explorer menu removed.' if options.remove_context_menu else 'Explorer menu installed. On Windows 11, use Show more options.'
+            code = 0
+        except Exception as exc:
+            text, code = str(exc), 1
+        user32 = ctypes.WinDLL('user32')
+        user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
+        user32.MessageBoxW(None, text, 'NTFS Compactor', 0x10 if code else 0x40)
+        sys.exit(code)
     app = App()
+    if options.target:
+        app.folder.set(os.path.abspath(options.target))
+        action = app.on_status if options.action == 'scan' else lambda: app.on_compress(decompress=options.action == 'decompress')
+        app.after(150, action)
     app.mainloop()

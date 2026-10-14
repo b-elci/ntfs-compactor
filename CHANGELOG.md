@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Optional per-user Explorer actions for files, folders, and folder backgrounds, including removal and single-file targeting (#1).
+- Default smart filtering based on the actual volume cluster size, compressed-format heuristics, and a change-aware no-benefit cache (#4).
 - v1.6.0 Windows x64 folder-release candidate with version metadata, hash-pinned build tools, Windows native smoke checks, and mandatory Defender scanning.
 - GitHub Actions packaging and an unpublished draft release after validation succeeds.
 - Decompression with confirmation and per-file Windows API verification.
@@ -26,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Disable UPX in the current release spec and document Windows release/signing procedures.
 
 ### Fixed
+- Handle paths beyond compact.exe's limit via a cancellable Windows API helper; verify both compression and decompression natively.
+- Classify ERROR_COMPRESSION_NOT_BENEFICIAL as skipped and preserve original compression when a new algorithm yields no benefit.
 - Prevent queued report clearing from deleting newly scanned rows.
 - Do not count failed commands as successful compression or hide native error messages in quiet mode.
 - Allow cancellation while compact.exe emits no output, and wait for workers before unlocking the UI or closing.

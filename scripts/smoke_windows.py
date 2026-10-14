@@ -94,6 +94,11 @@ def main():
         if result['successful'] != 1:
             raise RuntimeError('Extended-path compression verification failed')
         completed.append('long-path-compression')
+        result = compactor.run_compact_stream(['/u', '/i', '/f'], [long_file], print,
+                    verify=lambda file: compactor.get_compression_algorithm(file) == '-')
+        if result['successful'] != 1:
+            raise RuntimeError('Extended-path decompression verification failed')
+        completed.append('long-path-decompression')
     check_packaged_gui(args.exe.resolve(), compactor.APP_VERSION)
     completed.append('packaged-gui-startup-and-clean-close')
     args.report.write_text(json.dumps({'status': 'passed', 'checks': completed}, indent=2), encoding='utf-8')

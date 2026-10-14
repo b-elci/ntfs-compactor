@@ -112,6 +112,8 @@ def main():
     run([str(python), str(ROOT / 'scripts' / 'smoke_windows.py'), '--exe', str(executable), '--report', str(reports / 'native.json')])
     shutil.copy2(ROOT / 'LICENSE', package / 'LICENSE')
     shutil.copy2(ROOT / 'release' / 'README.txt', package / 'README.txt')
+    for script in ('Install-context-menu.cmd', 'Remove-context-menu.cmd'):
+        shutil.copy2(ROOT / 'release' / script, package / script)
     metadata = {
         'version': version,
         'built_at_utc': datetime.now(timezone.utc).isoformat(),

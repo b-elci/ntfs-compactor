@@ -8,6 +8,7 @@ import queue
 import tempfile
 import threading
 import time
+import sys
 from types import SimpleNamespace
 
 # Linux logic tests must not call or pretend to implement native Windows APIs.
@@ -57,6 +58,12 @@ class CompressionActionTests(unittest.TestCase):
 
 
 class FileScanTests(unittest.TestCase):
+    def test_explicit_file_target_respects_extension_filters(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'target.txt'
+            path.touch()
+            self.assertEqual(list(compactor.iter_files_under(str(path))), [str(path)])
+            self.assertEqual(list(compactor.iter_files_under(str(path), excluded_extensions=('txt',))), [])
     def test_windows_path_handles_local_unc_and_extended_paths(self):
         import ntpath
         with mock.patch.object(compactor.os, "name", "nt"), \
@@ -144,7 +151,14 @@ class BatchRunnerTests(unittest.TestCase):
             self.assertEqual('şğıöçü'.encode('cp857').decode(encoding), 'şğıöçü')
 
     def run_batch(self, files, factory, **kwargs):
-        with mock.patch.object(compactor.subprocess, "Popen", side_effect=factory):
+        def launch(cmd, **options):
+            process = factory(cmd, **options)
+            if '--result' in cmd:
+                import json
+                Path(cmd[cmd.index('--result') + 1]).write_text(
+                    json.dumps({'status': 'passed' if process.returncode == 0 else 'failed'}))
+            return process
+        with mock.patch.object(compactor.subprocess, "Popen", side_effect=launch):
             return compactor.run_compact_stream(["/c", "/exe:lzx"], files,
                                                 lambda line: None, **kwargs)
 
@@ -317,6 +331,146 @@ class ReportTests(unittest.TestCase):
                 self.assertEqual(len(list(csv.reader(source))), 1202)
 
 
+class SmartFilteringTests(unittest.TestCase):
+    def test_volume_cluster_size_drives_small_file_threshold(self):
+        self.assertIsNotNone(compactor.smart_skip_reason('small.bin', 4096, 4096))
+        self.assertIsNone(compactor.smart_skip_reason('larger.bin', 4097, 4096))
+        self.assertIsNotNone(compactor.smart_skip_reason('larger.bin', 8192, 65536))
+
+    def test_compressed_formats_are_optional_heuristics(self):
+        for extension in ('JPG', 'mp4', 'ogg', 'mp3', 'zip', '7z'):
+            self.assertEqual(compactor.smart_skip_reason('file.' + extension, 100000, 4096), 'already compressed file format')
+        self.assertIsNone(compactor.smart_skip_reason('game.dat', 100000, 4096))
+
+    def test_no_benefit_cache_invalidates_when_file_changes_or_algorithm_changes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'game.dat'
+            path.write_bytes(b'first')
+            cache = compactor.NoGainCache(str(Path(folder) / 'cache.sqlite'))
+            try:
+                cache.add(str(path), 'lzx')
+                self.assertTrue(cache.contains(str(path), 'lzx'))
+                self.assertFalse(cache.contains(str(path), 'xpress8k'))
+                path.write_bytes(b'changed contents')
+                self.assertFalse(cache.contains(str(path), 'lzx'))
+            finally:
+                cache.close()
+
+    def test_no_benefit_cache_catches_same_size_edits_with_preserved_write_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'game.dat'
+            path.write_bytes(b'first')
+            original = path.stat()
+            cache = compactor.NoGainCache(str(Path(folder) / 'cache.sqlite'))
+            try:
+                cache.add(str(path), 'lzx')
+                path.write_bytes(b'other')
+                os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+                self.assertFalse(cache.contains(str(path), 'lzx'))
+            finally:
+                cache.close()
+
+    def test_native_no_benefit_is_skipped_and_handle_is_closed(self):
+        library = mock.Mock()
+        library.CreateFileW.return_value = 123
+        wof = mock.Mock()
+        wof.WofSetFileDataLocation.return_value = 0x80070158
+        with mock.patch.object(compactor, 'kernel32', library), \
+             mock.patch.object(compactor, 'wofutil', wof), \
+             mock.patch.object(compactor, 'get_compression_algorithm', return_value='-'):
+            outcome = compactor.native_file_operation('file.bin', 'compress', 'lzx')
+        self.assertEqual(outcome, {'status': 'skipped', 'reason': 'no-benefit'})
+        library.CloseHandle.assert_called_once_with(123)
+
+    def test_unhelpful_recompression_restores_original_algorithm(self):
+        library = mock.Mock()
+        library.CreateFileW.return_value = 123
+        library.DeviceIoControl.return_value = True
+        wof = mock.Mock()
+        wof.WofSetFileDataLocation.side_effect = [0x80070158, 0]
+        with mock.patch.object(compactor, 'kernel32', library), \
+             mock.patch.object(compactor, 'wofutil', wof), \
+             mock.patch.object(compactor, 'get_compression_algorithm', return_value='LZX'):
+            result = compactor.native_file_operation('file.bin', 'compress', 'xpress4k')
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(wof.WofSetFileDataLocation.call_count, 2)
+        self.assertEqual(library.DeviceIoControl.call_args.args[1], 0x00090314)
+
+    def test_native_helper_skip_does_not_turn_into_a_failed_verification(self):
+        import json
+        def factory(cmd, **kwargs):
+            Path(cmd[cmd.index('--result') + 1]).write_text(json.dumps({'status': 'skipped', 'reason': 'no-benefit'}))
+            return FakeProcess()
+        skipped = []
+        with mock.patch.object(compactor, 'needs_native_path', return_value=True), \
+             mock.patch.object(compactor.subprocess, 'Popen', side_effect=factory):
+            result = compactor.run_compact_stream(['/c', '/exe:lzx'], ['file.bin'], lambda text: None,
+                         verify=lambda path: False, skip_callback=lambda *args: skipped.append(args))
+        self.assertEqual(result['skipped'], 1)
+        self.assertEqual(result['failed'], 0)
+        self.assertEqual(skipped, [('file.bin', 'no-benefit')])
+
+
+class FakeRegistry:
+    HKEY_CURRENT_USER = 'HKCU'
+    REG_SZ = 1
+    KEY_READ = 1
+    KEY_WRITE = 2
+    def __init__(self):
+        self.keys = {}
+    class Key:
+        def __init__(self, path): self.path = path
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    def OpenKey(self, hive, path, *args):
+        if path not in self.keys: raise FileNotFoundError(path)
+        return self.Key(path)
+    def CreateKey(self, hive, path):
+        parent, marker, tail = path.partition('\\NTFSCompactor')
+        current = parent + marker
+        self.keys.setdefault(current, {})
+        for part in tail.strip('\\').split('\\'):
+            if part:
+                current += '\\' + part
+                self.keys.setdefault(current, {})
+        return self.Key(path)
+    def SetValueEx(self, key, name, _, kind, value):
+        self.keys[key.path][name] = value
+    def QueryValueEx(self, key, name):
+        if name not in self.keys[key.path]: raise FileNotFoundError(name)
+        return self.keys[key.path][name], self.REG_SZ
+    def EnumKey(self, key, index):
+        prefix = key.path + '\\'
+        children = sorted({path[len(prefix):].split('\\')[0] for path in self.keys if path.startswith(prefix)})
+        if index >= len(children): raise OSError(259, 'No more items')
+        return children[index]
+    def DeleteKey(self, hive, path):
+        del self.keys[path]
+
+
+class ShellIntegrationTests(unittest.TestCase):
+    def test_per_user_install_handles_files_folders_and_background_and_uninstalls(self):
+        registry = FakeRegistry()
+        with mock.patch.dict(sys.modules, {'winreg': registry}), \
+             mock.patch.object(compactor, 'launch_command', return_value=[r'C:\App Folder\NTFS.exe']):
+            compactor.register_context_menu()
+            commands = {path: values[''] for path, values in registry.keys.items() if path.endswith('\\command')}
+            self.assertEqual(len(commands), 9)
+            for path, command in commands.items():
+                self.assertTrue(command.startswith('"C:\\App Folder\\NTFS.exe" --action '))
+                self.assertTrue(command.endswith('"%V"' if '\\Background\\' in path else '"%1"'))
+            compactor.register_context_menu(remove=True)
+        self.assertEqual(registry.keys, {})
+
+    def test_existing_unowned_registry_entry_is_preserved(self):
+        registry = FakeRegistry()
+        key = r'Software\Classes\Directory\shell\NTFSCompactor'
+        registry.keys[key] = {'MUIVerb': 'Existing application'}
+        with mock.patch.dict(sys.modules, {'winreg': registry}), self.assertRaises(ValueError):
+            compactor.register_context_menu()
+        self.assertEqual(registry.keys[key], {'MUIVerb': 'Existing application'})
+
+
 @unittest.skipUnless(os.name == "nt" or os.environ.get("DISPLAY"),
                      "Tk workflow tests require Windows or an X display")
 class GuiWorkflowTests(unittest.TestCase):
@@ -324,6 +478,7 @@ class GuiWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.app = compactor.App()
         self.app.withdraw()
+        self.app.smart_filter.set(False)
         self.ui_errors = []
         self.app.report_callback_exception = lambda *args: self.ui_errors.append(args)
         self.temp = tempfile.TemporaryDirectory()
@@ -428,6 +583,31 @@ class GuiWorkflowTests(unittest.TestCase):
         process.assert_not_called()
         self.assertIn("Stopped during scan", self.app.metrics_label["text"])
         self.assertEqual(str(self.app.btn_browse["state"]), "normal")
+
+    def test_smart_filter_skips_small_files_and_media_before_starting_process(self):
+        self.app.smart_filter.set(True)
+        (self.root / 'small.bin').write_bytes(b'small')
+        (self.root / 'video.MP4').write_bytes(b'media' * 2000)
+        with mock.patch.object(compactor, 'check_volume', return_value='NTFS'), \
+             mock.patch.object(compactor, 'get_cluster_size', return_value=4096), \
+             mock.patch.object(compactor, 'get_size_on_disk', side_effect=lambda path: Path(path).stat().st_size), \
+             mock.patch.object(compactor, 'get_compression_algorithm', return_value='-'), \
+             mock.patch.object(compactor.subprocess, 'Popen') as process:
+            self.app.on_compress()
+            self.pump()
+        process.assert_not_called()
+        self.assertIn('Skipped: 2', self.app.metrics_label['text'])
+
+    def test_selected_file_operation_does_not_include_siblings(self):
+        (self.root / 'selected.txt').write_text('chosen')
+        (self.root / 'sibling.txt').write_text('other')
+        self.app.folder.set(str(self.root / 'selected.txt'))
+        with mock.patch.object(compactor, 'get_size_on_disk', return_value=6), \
+             mock.patch.object(compactor, 'get_compression_algorithm', return_value='-'):
+            self.app.on_status()
+            self.pump()
+        self.assertEqual(self.app.report_store.count, 1)
+        self.assertTrue(next(self.app.report_store.rows())['path'].endswith('selected.txt'))
 
 
 if __name__ == "__main__":

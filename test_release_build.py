@@ -22,6 +22,8 @@ class ReleaseGateTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / 'release').mkdir()
         (self.root / 'release' / 'README.txt').write_text('Unsigned candidate')
+        for name in ('Install-context-menu.cmd', 'Remove-context-menu.cmd'):
+            (self.root / 'release' / name).write_text('test')
         (self.root / 'LICENSE').write_text('Test license')
         (self.root / 'compactor.py').write_text('APP_VERSION = "1.6.0"\n')
         self.package = self.root / 'dist' / 'NTFS-Compactor-v1.6.0'
