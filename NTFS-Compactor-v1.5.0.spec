@@ -26,7 +26,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # Avoid optional executable packing, which can contribute to AV false positives.
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

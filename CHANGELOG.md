@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- v1.6.0 Windows x64 folder-release candidate with version metadata, hash-pinned build tools, Windows native smoke checks, and mandatory Defender scanning.
+- GitHub Actions packaging and an unpublished draft release after validation succeeds.
+- Decompression with confirmation and per-file Windows API verification.
+- Extension and folder exclusion patterns, NTFS volume and write-access checks.
+- Disk-backed, paginated status reports with full CSV export.
+- Verified outcome counts, separate scan/measurement errors, elapsed time, throughput, and approximate ETA.
+- Regression tests for failed processes, silent-process cancellation, filters, report pagination, and real Tk workflows with mocked Windows operations.
+
+### Changed
+- Default to XPRESS8K and skip already compressed files.
+- Combine initial file enumeration, measurement, and compression analysis into one scan using a disk-backed operation plan.
+- Adapt compression batches from 32 up to 128 files; reduce failed batches and retry only unverified files.
+- Bound worker queues and limit UI work per tick; keep folder and filter settings fixed while operating.
+- Use the system compact.exe path, extended Windows paths, and OEM-code-page subprocess decoding.
+- Require Python 3.12+ for source development, including junction-aware scanning.
+- Disable UPX in the current release spec and document Windows release/signing procedures.
+
+### Fixed
+- Prevent queued report clearing from deleting newly scanned rows.
+- Do not count failed commands as successful compression or hide native error messages in quiet mode.
+- Allow cancellation while compact.exe emits no output, and wait for workers before unlocking the UI or closing.
+- Avoid uninterruptible final scans after cancellation and invalidate stale reports after operations.
+- Reset the last Windows error before querying compressed file sizes.
+
 ## [1.2.0] - 2026-06-06
 
 ### Added

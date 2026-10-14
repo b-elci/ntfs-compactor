@@ -3,7 +3,7 @@
 # This application uses only Python standard library modules.
 # No external dependencies are required!
 
-# Minimum Python version: 3.6+
+# Minimum Python version: 3.12+
 
 # Standard library modules used:
 # - os
@@ -13,3 +13,4 @@
 # - subprocess
 # - ctypes
 # - tkinter (included with Python on Windows)
+# - sqlite3, tempfile, json, fnmatch, locale, time, csv

@@ -2,7 +2,7 @@
 
 A modern GUI application for Windows that enables advanced NTFS compression using XPRESS and LZX algorithms. This tool provides an easy-to-use interface for compressing files and folders with Windows' built-in advanced compression algorithms, offering better compression ratios than the traditional NTFS compression.
 
-![Python Version](https://img.shields.io/badge/python-3.6+-blue.svg)
+![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 
@@ -21,36 +21,42 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
   - See which algorithm is currently applied
   - Display actual size vs. size on disk
   - Calculate compression savings percentage
+  - Browse reports in pages of 500 rows and export the entire report as CSV
 
 - 🎯 **Smart Compression Options**
   - Skip already compressed files
   - Recompress files if algorithm differs
-  - Defer initial measurement for faster startup (Default: On)
+  - Balanced defaults: XPRESS8K and skip files that are already compressed
+  - Exclude extensions and folders using optional patterns
+  - Remove compression with the Decompress action
   - Verbose logging toggle for detailed output control
 
 - 💻 **User-Friendly Interface**
   - Modern Tkinter GUI
-  - Real-time ASCII progress bar (in non-verbose mode)
+  - Progress, elapsed time, processed bytes per second, and estimated time remaining
   - Live log output with performance optimizations
   - Stop operation at any time
 
 - 📈 **Comprehensive Reporting**
   - Before and after disk space comparison
-  - File-by-file compression results
+  - Verified success, failure, skipped, and unprocessed counts
+  - Separate scan and final-measurement errors
   - Easy-to-read formatted output
 
 ## Requirements
 
 - **Operating System**: Windows 10/11 (with NTFS filesystem)
-- **Python**: 3.6 or higher
-- **Privileges**: Administrator rights (required for compression operations)
+- **Python**: 3.12 or higher, including Tkinter
+- **Privileges**: Write access to the selected folder and files; elevation may be needed for protected folders
 
 ## Installation
 
 1. **Download the latest release**
    - Go to [Releases](https://github.com/b-elci/ntfs-compactor/releases)
-   - Download `NTFS-Compactor-v1.5.0-Windows.zip`
-   - Extract and run `NTFS-Compactor-v1.5.0.exe` as administrator
+   - For the v1.6.0 candidate, download `NTFS-Compactor-v1.6.0-Windows-x64.zip`
+   - Extract the complete folder and run `NTFS-Compactor-v1.6.0.exe`; keep `_internal` beside it
+   - Protected folders may require administrator rights
+   - The candidate is unsigned; SmartScreen may show an unknown-publisher warning
    - No Python installation needed!
 
 2. **Or clone the repository** (for Python users)
@@ -78,7 +84,7 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 1. **Select a Folder**
    - Click the "Browse..." button
    - Choose the folder you want to compress
-   - The tool will measure the current disk usage (unless "Defer measurement" is checked)
+   - Measurement runs when an operation starts; selecting a folder does not trigger a scan
 
 2. **Choose Compression Algorithm**
    - **XPRESS4K**: Fastest compression, lowest ratio (~5-15% savings)
@@ -93,11 +99,33 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 4. **Operations**
    - **Show Status**: Scan and display current compression status without making changes
    - **Compress**: Apply selected compression algorithm to all files in folder
+   - **Decompress**: Remove compression from matching compressed files, after confirmation
    - **Stop**: Cancel the current operation
+   - **Previous / Next**: Browse the status report, 500 rows per page
+   - **Save Report**: Export every scanned row, including rows on other pages
 
 ### Advanced Options
 
-- **Defer measurement**: Check this option to skip the initial folder size measurement, which can be slow for large folders. The measurement will be performed when you start compression.
+- **Exclude extensions**: Separate entries with `;`, for example `zip; .mp4; *.jpg`.
+  Matching is case-insensitive. Leave blank to include all extensions.
+- **Exclude folders**: Use names, relative paths, or wildcard patterns separated
+  by `;`, for example `cache; node_modules; backups/*`. Matching folders are
+  pruned before their contents are scanned. Directory symlinks and junctions
+  are not followed; file symlinks are skipped.
+- Filters apply to status, compression, decompression, and size measurements.
+  Before/after totals describe matching files rather than excluded content.
+- Folder, filter, and algorithm controls are locked for the duration of an
+  operation. Clear Report is disabled during a scan; an export during a scan
+  contains the rows received so far. Copy Page copies only the displayed page.
+- Compression batches start at 32 files and adapt up to 128 after successes;
+  failures are retried in smaller groups, excluding already verified successes.
+- Stop also works while `compact.exe` is silent. Windows calls already in flight
+  may finish before cancellation is observed. Cancelled runs skip the final
+  full size measurement. An interrupted run may have changed some files;
+  run Show Status to inspect their final state.
+- Throughput represents logical bytes processed, including failed attempts that
+  reached a final outcome. ETA is approximate and depends on file sizes and
+  compressibility. It is not a benchmark of the compression algorithm.
 
 ### Understanding the Output
 
@@ -117,6 +145,15 @@ This tool wraps the Windows `compact.exe` command-line utility with a modern GUI
 2. **Compression**: Applies compression using `compact /c /exe:algorithm`
 3. **Recompression**: Changes differing algorithms directly using `compact /F`
 4. **Size Measurement**: Uses Windows API `GetCompressedFileSizeW` for accurate disk space reporting
+5. **Decompression**: Uses `compact /u /i /f` and verifies the resulting state
+6. **Scalability**: A single initial scan writes a temporary operation plan;
+   reports are stored in a temporary SQLite database, keeping only the visible
+   page in the UI. No external Python packages are required.
+7. **Validation**: Checks the volume is NTFS and tests folder write access before
+   starting. Each operated file's final compression state is checked via the
+   Windows API; localized command output is used for diagnostics, not success
+   detection. After an operation, the old status report is cleared to avoid
+   displaying stale results.
 
 ### Compression Algorithms
 
@@ -135,7 +172,7 @@ This tool wraps the Windows `compact.exe` command-line utility with a modern GUI
 ⚠️ **Warnings and Limitations**
 
 1. **Windows Only**: This tool only works on Windows with NTFS file system
-2. **Administrator Rights**: Required for applying compression
+2. **Permissions**: Folder write access is checked up front; individual file ACLs or locks can still cause failures
 3. **File Access**: Files in use cannot be compressed
 4. **Performance**: Compression is CPU-intensive and may take time for large folders
 5. **Compatibility**: Compressed files remain fully compatible and accessible
@@ -164,6 +201,14 @@ This tool wraps the Windows `compact.exe` command-line utility with a modern GUI
 - **Solution**: Check that the drive supports NTFS compression
 
 ## Contributing
+
+For Windows release builds, code signing, and antivirus false-positive reports,
+see [BUILDING.md](BUILDING.md).
+
+Run the existing tests with `python -m unittest discover -v`. On Linux, native
+Windows DLL loading is stubbed for logic tests; real Windows compression is
+not validated. GUI workflow tests use real Tk widgets with mocked Windows
+operations and require Windows or a Linux X display (`DISPLAY`).
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes:
 

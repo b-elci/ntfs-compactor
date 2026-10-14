@@ -27,12 +27,21 @@ import csv
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import re
+import time
+import tempfile
+import json
+import sqlite3
+import fnmatch
+import locale
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 # -------------------------
 # Windows API — size and attribute helpers
 # -------------------------
+
+if __name__ == "__main__" and os.name != "nt":
+    sys.exit("NTFS Compactor requires Windows 10/11 and an NTFS volume.")
 
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 
@@ -44,39 +53,106 @@ kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD
 kernel32.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetFileAttributesW.restype = wintypes.DWORD
 
-# Memory Status for batch sizing
-class MEMORYSTATUSEX(ctypes.Structure):
-    _fields_ = [
-        ("dwLength", wintypes.DWORD),
-        ("dwMemoryLoad", wintypes.DWORD),
-        ("ullTotalPhys", ctypes.c_uint64),
-        ("ullAvailPhys", ctypes.c_uint64),
-        ("ullTotalPageFile", ctypes.c_uint64),
-        ("ullAvailPageFile", ctypes.c_uint64),
-        ("ullTotalVirtual", ctypes.c_uint64),
-        ("ullAvailVirtual", ctypes.c_uint64),
-        ("ullAvailExtendedVirtual", ctypes.c_uint64),
-    ]
-
-kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
-kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
-
 def get_optimal_batch_size():
-    try:
-        stat = MEMORYSTATUSEX()
-        stat.dwLength = ctypes.sizeof(stat)
-        if kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            total_gb = stat.ullTotalPhys / (1024**3)
-            # User reported OOM with 50 files on 16GB.
-            # Conservative scaling: ~1.0 files per GB.
-            # 16GB -> 16 files.
-            # 8GB -> 8 files.
-            # Cap at 15 to be safe.
-            size = int(total_gb * 1.0)
-            return max(5, min(15, size))
-    except:
+    """Initial batch size; the runner adapts between 1 and 128 files."""
+    return 32
+
+
+def windows_path(path):
+    path = os.path.abspath(path)
+    if os.name != "nt" or path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
+
+
+def compact_executable():
+    if os.name == "nt":
+        return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "compact.exe")
+    return "compact.exe"
+
+
+def compact_output_encoding():
+    # Native console tools use the OEM code page, not Python's UTF-8 mode/ANSI locale.
+    if os.name == "nt":
+        api = kernel32.GetOEMCP
+        api.argtypes = []
+        api.restype = wintypes.UINT
+        code_page = api()
+        if code_page:
+            return f"cp{code_page}"
+    return locale.getpreferredencoding(False)
+
+
+def check_volume(folder):
+    """Return the filesystem name and fail clearly if it cannot be queried."""
+    root = ctypes.create_unicode_buffer(32768)
+    fs = ctypes.create_unicode_buffer(256)
+    api = kernel32.GetVolumePathNameW
+    api.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    api.restype = wintypes.BOOL
+    if not api(windows_path(folder), root, len(root)):
+        raise OSError(ctypes.get_last_error(), "Cannot determine the selected volume")
+    api = kernel32.GetVolumeInformationW
+    api.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD,
+                   ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                   ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD]
+    api.restype = wintypes.BOOL
+    if not api(root.value, None, 0, None, None, None, fs, len(fs)):
+        raise OSError(ctypes.get_last_error(), "Cannot read volume information")
+    return fs.value
+
+
+def check_write_access(folder):
+    # Test effective access rather than assuming administrator membership.
+    with tempfile.TemporaryFile(dir=folder):
         pass
-    return 10
+
+
+class ReportStore:
+    """Keep the complete report on disk, rendering only one page in Tk."""
+    def __init__(self):
+        fd, self.path = tempfile.mkstemp(prefix="ntfs-report-", suffix=".sqlite")
+        os.close(fd)
+        self.db = sqlite3.connect(self.path)
+        self.db.execute("CREATE TABLE report (id INTEGER PRIMARY KEY, data TEXT)")
+        self.count = 0
+        self.sort_column = None
+        self.descending = False
+
+    def clear(self):
+        self.db.execute("DELETE FROM report")
+        self.db.commit()
+        self.count = 0
+        self.sort_column = None
+        self.descending = False
+
+    def append(self, rows):
+        self.db.executemany("INSERT INTO report(data) VALUES (?)",
+                            [(json.dumps(row, ensure_ascii=False),) for row in rows])
+        self.db.commit()
+        self.count += len(rows)
+
+    def rows(self, offset=0, limit=None):
+        keys = {"status": "status", "algorithm": "algorithm", "size": "size_raw",
+                "ondisk": "ondisk_raw", "savings": "savings_raw", "path": "path_raw"}
+        order = "id"
+        if self.sort_column in keys:
+            order = "json_extract(data, '$.%s') %s, id" % (
+                keys[self.sort_column], "DESC" if self.descending else "ASC")
+        sql = "SELECT data FROM report ORDER BY " + order
+        args = ()
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            args = (limit, offset)
+        for (data,) in self.db.execute(sql, args):
+            yield json.loads(data)
+
+    def close(self):
+        self.db.close()
+        os.unlink(self.path)
+
 
 FILE_ATTRIBUTE_COMPRESSED = 0x800
 WOF_PROVIDER_FILE = 2
@@ -107,25 +183,10 @@ try:
 except OSError:
     wofutil = None
 
-def get_folder_sizes(folder):
-    total_orig = 0
-    total_disk = 0
-    for root, dirs, files in os.walk(folder):
-        for f in files:
-            path = os.path.join(root, f)
-            try:
-                total_orig += os.path.getsize(path)
-                ondisk = get_size_on_disk(path)
-                if ondisk:
-                    total_disk += ondisk
-            except Exception:
-                pass
-    return total_orig, total_disk
-
-
 def get_size_on_disk(path):
     high = wintypes.DWORD(0)
-    low = kernel32.GetCompressedFileSizeW(path, ctypes.byref(high))
+    ctypes.set_last_error(0)
+    low = kernel32.GetCompressedFileSizeW(windows_path(path), ctypes.byref(high))
     err = ctypes.get_last_error()
     if low == 0xFFFFFFFF and err != 0:
         return None
@@ -133,7 +194,7 @@ def get_size_on_disk(path):
 
 def is_compressed_attribute(path):
     """Does the file have compressed attribute? (Could be LZNT1 or system compression)"""
-    attrs = kernel32.GetFileAttributesW(path)
+    attrs = kernel32.GetFileAttributesW(windows_path(path))
     if attrs == 0xFFFFFFFF:
         return None  # access error
     return bool(attrs & FILE_ATTRIBUTE_COMPRESSED)
@@ -146,7 +207,7 @@ def get_compression_algorithm(path):
         info = WofFileCompressionInfo()
         info_size = wintypes.ULONG(ctypes.sizeof(info))
         result = wofutil.WofIsExternalFile(
-            path,
+            windows_path(path),
             ctypes.byref(is_external),
             ctypes.byref(provider),
             ctypes.byref(info),
@@ -166,17 +227,8 @@ def get_compression_algorithm(path):
 # compact.exe helpers
 # -------------------------
 
-def compact_query_line_for_algorithm(line):
-    """Capture algorithm name from compact /q output line.
-       Algorithm names in parentheses (LZX/XPRESS*) appear regardless of locale."""
-    s = line.upper()
-    for tag in ("(LZX)", "(XPRESS4K)", "(XPRESS8K)", "(XPRESS16K)"):
-        if tag in s:
-            return tag.strip("()")
-    return None
-
 def run_compact(args, cwd=None):
-    cmd = ["compact.exe"] + args
+    cmd = [compact_executable()] + args
     try:
         # CREATE_NO_WINDOW flag prevents console window from appearing
         CREATE_NO_WINDOW = 0x08000000
@@ -184,8 +236,8 @@ def run_compact(args, cwd=None):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            encoding="utf-8",       # encoding added
-            errors="ignore",        # ignore problematic characters
+            encoding=compact_output_encoding(),
+            errors="replace",
             cwd=cwd,
             check=False,
             creationflags=CREATE_NO_WINDOW  # Prevents console window flashing
@@ -193,10 +245,6 @@ def run_compact(args, cwd=None):
         return p.returncode, p.stdout
     except Exception as e:
         return 1, f"[compact error] {e}"
-
-def compact_query_folder(folder):
-    """Return output from compact /s:"folder" (without /q to ensure file listing)."""
-    return run_compact(["/s:{}".format(folder)])
 
 def compact_compress_file(path, algorithm_switch, force=False):
     """Compress specified file with selected algorithm (/c /exe:xxx)."""
@@ -206,123 +254,161 @@ def compact_compress_file(path, algorithm_switch, force=False):
     args.extend(["/exe:{}".format(algorithm_switch), path])
     return run_compact(args)
 
-def run_compact_stream(args, files, callback_line, stop_event=None, progress_callback=None):
-    """Run compact.exe on a batch of files, streaming output to callback."""
-    # Windows CreateProcess limit is 32k chars.
-    # We must respect both the file count limit (to avoid OOM) AND the character limit.
-    # Optimization: Group by directory and use CWD to reduce command line length.
-    
-    max_files_per_batch = get_optimal_batch_size()
-    max_chars = 30000 # Safe limit below 32767
-    
-    base_cmd = ["compact.exe"] + args
-    base_len = sum(len(a) + 1 for a in base_cmd) # +1 for spaces
-    
-    current_batch = []
-    current_batch_dir = None
-    current_batch_len = base_len
-    
-    def execute_batch(batch, cwd):
-        if not batch: return
+def run_compact_stream(args, files, callback_line, stop_event=None,
+                       progress_callback=None, verify=None, result_callback=None):
+    """Run adaptive batches with cancellable pipe reads and explicit outcomes.
 
-        # Recursive retry logic for OOM
-        def run_subset(subset):
-            if not subset: return
-            
-            cmd = base_cmd + subset
-            output_buffer = []
-            oom_detected = False
-            
+    files may be an iterator of paths or (path, logical_size) pairs.
+    verify(path) checks the requested final state independently of localized output.
+    """
+    stats = dict(successful=0, failed=0, skipped=0, cancelled=0, bytes=0)
+    batch_limit = get_optimal_batch_size()
+    growth_cooldown = 0
+    stop_event = stop_event or threading.Event()
+    base_cmd = [compact_executable()] + args
+    base_length = len(subprocess.list2cmdline(base_cmd).encode("utf-16-le")) // 2
+
+    def record(kind, entries):
+        stats[kind] += len(entries)
+        stats["bytes"] += sum(size for _, size in entries)
+        if progress_callback:
+            progress_callback(len(entries))
+        if result_callback:
+            result_callback(dict(stats))
+
+    def execute(entries, directory, grow=True):
+        nonlocal batch_limit, growth_cooldown
+        if stop_event.is_set():
+            stats["cancelled"] += len(entries)
+            return
+        cmd = base_cmd + [os.path.basename(path) for path, _ in entries]
+        output = queue.Queue(maxsize=256)
+        reader_done = threading.Event()
+        reader_errors = []
+        process = None
+        reader = None
+        cancelled = False
+        tail = []
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, encoding=compact_output_encoding(),
+                errors="replace", creationflags=0x08000000, bufsize=1,
+                cwd=windows_path(directory))
+
+            def read_output():
+                try:
+                    for line in process.stdout:
+                        if stop_event.is_set():
+                            break
+                        while not stop_event.is_set():
+                            try:
+                                output.put(line.rstrip(), timeout=0.05)
+                                break
+                            except queue.Full:
+                                continue
+                except Exception as exc:
+                    reader_errors.append(str(exc))
+                finally:
+                    reader_done.set()
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            while not reader_done.is_set() or not output.empty():
+                if stop_event.is_set():
+                    cancelled = True
+                    if process.poll() is None:
+                        process.terminate()
+                    break
+                try:
+                    line = output.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                tail.append(line)
+                tail = tail[-20:]
+                callback_line(line)
+            # A process may close stdout before it exits; keep cancellation active.
+            while not cancelled and process.poll() is None:
+                if stop_event.wait(0.05):
+                    cancelled = True
+                    process.terminate()
             try:
-                CREATE_NO_WINDOW = 0x08000000
-                p = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    encoding="utf-8",
-                    errors="ignore",
-                    creationflags=CREATE_NO_WINDOW,
-                    bufsize=1,
-                    universal_newlines=True,
-                    cwd=cwd
-                )
-                
-                for line in p.stdout:
-                    if stop_event and stop_event.is_set():
-                        p.terminate()
-                        break
-                    line_stripped = line.strip()
-                    output_buffer.append(line_stripped)
-                    if "Out of memory" in line_stripped:
-                        oom_detected = True
-                
-                p.wait()
-                
-                if stop_event and stop_event.is_set():
-                    return
-
-                if oom_detected:
-                    if len(subset) > 1:
-                        # OOM detected and we can split
-                        mid = len(subset) // 2
-                        run_subset(subset[:mid])
-                        run_subset(subset[mid:])
-                    else:
-                        # Single file failed with OOM.
-                        # As per user request: Assume it's due to path depth and skip immediately.
-                        callback_line(f"[Error] Path too deep, skipped: {subset[0]}")
+                code = process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                code = process.wait()
+            if reader_errors:
+                raise OSError("Cannot read compact output: " + "; ".join(reader_errors))
+            if cancelled or stop_event.is_set():
+                stats["cancelled"] += len(entries)
+                return
+            succeeded, failed = [], []
+            for entry in entries:
+                try:
+                    ok = verify(entry[0]) if verify else code == 0
+                except Exception:
+                    ok = False
+                (succeeded if ok else failed).append(entry)
+            record("successful", succeeded)
+            if failed and len(entries) > 1:
+                batch_limit = max(1, batch_limit // 2)
+                growth_cooldown = 4
+                # Retry only unverified files; do not recompress successes.
+                middle = max(1, len(failed) // 2)
+                execute(failed[:middle], directory, grow=False)
+                if failed[middle:]:
+                    execute(failed[middle:], directory, grow=False)
+            elif failed:
+                record("failed", failed)
+                callback_line("[Error] Failed: %s (exit %s) %s" %
+                              (failed[0][0], code, " | ".join(tail[-3:])))
+            elif succeeded and grow:
+                if growth_cooldown:
+                    growth_cooldown -= 1
                 else:
-                    # No OOM -> flush output
-                    for line in output_buffer:
-                        callback_line(line)
-                    
-                    if progress_callback:
-                        progress_callback(len(subset))
+                    batch_limit = min(128, batch_limit * 2)
+        except Exception as exc:
+            if stop_event.is_set():
+                stats["cancelled"] += len(entries)
+            else:
+                record("failed", entries)
+                callback_line("[Error] Batch failed: %s" % exc)
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                if reader is not None:
+                    reader.join(timeout=2)
+                if process.stdout is not None:
+                    process.stdout.close()
 
-            except Exception as e:
-                callback_line(f"[Error] Batch execution failed: {e}")
-
-        run_subset(batch)
-
-    for path in files:
-        if stop_event and stop_event.is_set():
+    batch, directory, length = [], None, 0
+    for item in files:
+        if stop_event.is_set():
             break
-            
-        # Pre-check: Skip paths that are likely too long for compact.exe
-        # Standard MAX_PATH is 260. We use a safe margin.
-        if len(os.path.abspath(path)) > 255:
-            callback_line(f"[Skipped] Path too long (>255 chars): {path}")
-            if progress_callback:
-                progress_callback(1)
+        path, size = item if isinstance(item, tuple) else (item, 0)
+        parent, name = os.path.split(path)
+        # CreateProcess counts UTF-16 code units, including quoting and spaces.
+        name_length = len(subprocess.list2cmdline([name]).encode("utf-16-le")) // 2 + 1
+        candidate_length = base_length + name_length
+        if batch and (parent != directory or len(batch) >= batch_limit or
+                      length + name_length > 30000):
+            execute(batch, directory)
+            batch, length = [], 0
+            if stop_event.is_set():
+                break
+        directory = parent
+        if candidate_length > 30000:
+            record("skipped", [(path, size)])
+            callback_line("[Skipped] Command argument too long: " + path)
             continue
-            
-        dname, fname = os.path.split(path)
-        
-        # If directory changed, flush previous batch
-        if current_batch and dname != current_batch_dir:
-            execute_batch(current_batch, current_batch_dir)
-            current_batch = []
-            current_batch_dir = None
-            current_batch_len = base_len
-            
-        current_batch_dir = dname
-        
-        # Quote path length approximation (fname + 2 quotes + 1 space)
-        path_len = len(fname) + 3 
-        
-        # Check limits
-        if (len(current_batch) >= max_files_per_batch) or \
-           (current_batch_len + path_len > max_chars):
-            execute_batch(current_batch, current_batch_dir)
-            current_batch = []
-            current_batch_len = base_len
-            
-        current_batch.append(fname)
-        current_batch_len += path_len
-        
-    # Execute remaining
-    if current_batch and not (stop_event and stop_event.is_set()):
-        execute_batch(current_batch, current_batch_dir)
+        if not batch:
+            length = base_length
+        batch.append((path, size))
+        length += name_length
+    if batch:
+        execute(batch, directory)
+    return stats
 
 # -------------------------
 # Helper — size formatting
@@ -334,7 +420,7 @@ def fmt_bytes(n):
     units = ["B", "KB", "MB", "GB", "TB"]
     size = float(n)
     for unit in units:
-        if size < 1024.0 or unit == units[-1]:
+        if abs(size) < 1024.0 or unit == units[-1]:
             if unit == "B":
                 return f"{size:.0f} {unit}"
             else:
@@ -358,11 +444,60 @@ def percent_saving(orig, ondisk):
 # Core functions (Status and Compression)
 # -------------------------
 
-def iter_files_under(folder):
-    """Yield all files (not folders) under folder."""
-    for root, dirs, files in os.walk(folder):
+def parse_patterns(text):
+    return tuple(part.strip().casefold() for part in text.split(";") if part.strip())
+
+
+def iter_files_under(folder, excluded_extensions=(), excluded_folders=(),
+                     stop_event=None, on_error=None):
+    """Walk once, pruning exclusions and directory links/junctions."""
+    root_folder = os.path.abspath(folder)
+    def walk_error(exc):
+        if on_error:
+            on_error(exc)
+    for root, dirs, files in os.walk(root_folder, followlinks=False, onerror=walk_error):
+        if stop_event and stop_event.is_set():
+            return
+        kept = []
+        for name in dirs:
+            path = os.path.join(root, name)
+            relative = os.path.relpath(path, root_folder).replace("\\", "/").casefold()
+            if os.path.islink(path) or (hasattr(os.path, "isjunction") and os.path.isjunction(path)):
+                continue
+            if any(fnmatch.fnmatchcase(name.casefold(), pattern) or
+                   fnmatch.fnmatchcase(relative, pattern.replace("\\", "/"))
+                   for pattern in excluded_folders):
+                continue
+            kept.append(name)
+        dirs[:] = kept
         for name in files:
-            yield os.path.join(root, name)
+            if stop_event and stop_event.is_set():
+                return
+            if any(fnmatch.fnmatchcase(name.casefold(),
+                        pattern if "*" in pattern or "?" in pattern else "*" +
+                        (pattern if pattern.startswith(".") else "." + pattern))
+                   for pattern in excluded_extensions):
+                continue
+            path = os.path.join(root, name)
+            if not os.path.islink(path):
+                yield path
+
+
+def scan_files(folder, excluded_extensions=(), excluded_folders=(),
+               stop_event=None, on_error=None):
+    for path in iter_files_under(folder, excluded_extensions, excluded_folders,
+                                 stop_event, on_error):
+        try:
+            size = os.path.getsize(path)
+            disk = get_size_on_disk(path)
+            algorithm = get_compression_algorithm(path)
+            if disk is None or algorithm is None:
+                raise OSError("Cannot read file size or compression state: " + path)
+            yield dict(path=path, size=size, disk=disk, algorithm=algorithm)
+        except Exception as exc:
+            if on_error:
+                on_error(exc)
+
 
 def compression_action(current_alg, target_alg, behavior):
     """Return skip, compress, or recompress for a file."""
@@ -371,76 +506,6 @@ def compression_action(current_alg, target_alg, behavior):
     if behavior == "skip" or current_alg.casefold() == target_alg.casefold():
         return "skip"
     return "recompress"
-
-def detect_algorithm_via_compact_map(folder):
-    """Parse compact /s output line by line:
-       Extract path -> algorithm mapping based on flags:
-       x -> XPRESS4K
-       X -> XPRESS8K/16K (Ambiguous)
-       l -> LZX
-       C -> LZNT1
-    """
-    ret, out = compact_query_folder(folder)
-    algomap = {}
-    if not out:
-        return algomap
-
-    current_dir = None
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        # Check for directory header (e.g. "Listing C:\Path\")
-        if line.endswith("\\"):
-            # Try to find drive letter sequence like "C:\"
-            idx = line.find(":\\")
-            if idx != -1 and idx > 0:
-                candidate = line[idx-1:]
-                if os.path.isdir(candidate):
-                    current_dir = candidate
-                else:
-                    current_dir = candidate
-        
-        # Try to parse file line with flag
-        # Format: Size : Compressed = Ratio ... 1 Flag Filename
-        # Regex: ^\d+\s*:\s*\d+\s*=\s*[\d,.]+\s+.*?\s+1\s+([CxlX])\s+(.*)$
-        match = re.match(r'^\d+\s*:\s*\d+\s*=\s*[\d,.]+\s+.*?\s+1\s+([CxlX])\s+(.*)$', line)
-        if match:
-            flag, filename = match.groups()
-            alg = None
-            if flag == 'x': alg = "XPRESS4K"
-            elif flag == 'X': alg = "XPRESS8K/16K"
-            elif flag == 'l': alg = "LZX"
-            elif flag == 'C': alg = "LZNT1"
-            
-            if alg:
-                fname = filename.strip()
-                if current_dir:
-                    fullpath = os.path.join(current_dir, fname)
-                else:
-                    fullpath = os.path.join(folder, fname)
-                
-                # Normalize path for consistent lookup
-                norm_path = os.path.normcase(os.path.abspath(fullpath))
-                algomap[norm_path] = alg
-                continue
-
-        # Fallback: Check for (ALG) format if compact /q style is present
-        alg = compact_query_line_for_algorithm(line)
-        if alg:
-            parts = line.split(f"({alg})")
-            if len(parts) > 1:
-                filename = parts[-1].strip()
-                if current_dir:
-                    fullpath = os.path.join(current_dir, filename)
-                else:
-                    fullpath = os.path.join(folder, filename)
-                
-                norm_path = os.path.normcase(os.path.abspath(fullpath))
-                algomap[norm_path] = alg
-
-    return algomap
 
 # -------------------------
 # GUI
@@ -475,20 +540,26 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"NTFS Advanced Compression v{APP_VERSION} (XPRESS/LZX)")
-        self.geometry("980x640")
+        self.geometry("1120x720")
 
         self.folder = tk.StringVar()
-        self.alg_label = tk.StringVar(value=ALG_OPTIONS[-1][0])  # default LZX
-        self.beh_label = tk.StringVar(value=BEHAVIOR_OPTIONS[1][0])  # default recompress_if_different
+        self.alg_label = tk.StringVar(value=ALG_OPTIONS[1][0])  # balanced XPRESS8K
+        self.beh_label = tk.StringVar(value=BEHAVIOR_OPTIONS[0][0])  # skip existing compressed files
         self.verbose = tk.BooleanVar(value=False)
 
+        self.report_store = ReportStore()
+        self.report_page = 0
+        self.page_size = 500
+        self._busy = False
+        self._closing = False
         self._build_ui()
 
         # thread communication
-        self.log_q = queue.Queue()
-        self.ui_q = queue.Queue()
+        self.log_q = queue.Queue(maxsize=2000)
+        self.ui_q = queue.Queue(maxsize=2000)
         self.worker = None
         self.stop_flag = threading.Event()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build_ui(self):
         frm = ttk.Frame(self, padding=10)
@@ -502,7 +573,8 @@ class App(tk.Tk):
         ttk.Label(top, text="Folder:").pack(side="left")
         self.ent_folder = ttk.Entry(top, textvariable=self.folder, width=70)
         self.ent_folder.pack(side="left", padx=6)
-        ttk.Button(top, text="Browse...", command=self.choose_folder).pack(side="left")
+        self.btn_browse = ttk.Button(top, text="Browse...", command=self.choose_folder)
+        self.btn_browse.pack(side="left")
         ttk.Checkbutton(top, text="Verbose Logging", variable=self.verbose).pack(side="left", padx=8)
 
         # Right side: Support button (opens Buy Me a Coffee link)
@@ -532,6 +604,19 @@ class App(tk.Tk):
                                       textvariable=self.beh_label)
         self.beh_combo.grid(row=0, column=3, sticky="w", padx=6)
 
+        filters = ttk.Frame(frm)
+        filters.pack(fill="x", pady=(0, 8))
+        self.exclude_extensions = tk.StringVar()
+        self.exclude_folders = tk.StringVar()
+        ttk.Label(filters, text="Exclude extensions (;):").pack(side="left")
+        self.ext_entry = ttk.Entry(filters, textvariable=self.exclude_extensions, width=24)
+        self.ext_entry.pack(side="left", padx=6)
+        ttk.Label(filters, text="Exclude folders (;):").pack(side="left")
+        self.exclude_entry = ttk.Entry(filters, textvariable=self.exclude_folders, width=30)
+        self.exclude_entry.pack(side="left", padx=6)
+        self.metrics_label = ttk.Label(frm, text="Ready")
+        self.metrics_label.pack(fill="x", pady=(0, 6))
+
         # Buttons
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(0,8))
@@ -547,6 +632,9 @@ class App(tk.Tk):
 
         self.btn_compress = ttk.Button(btns, text="Compress", command=self.on_compress)
         self.btn_compress.pack(side="left", padx=6)
+
+        self.btn_decompress = ttk.Button(btns, text="Decompress", command=lambda: self.on_compress(decompress=True))
+        self.btn_decompress.pack(side="left", padx=6)
 
         self.btn_stop = ttk.Button(btns, text="Stop", command=self.on_stop, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
@@ -599,12 +687,21 @@ class App(tk.Tk):
         # Right-click context menu for the status report
         self.status_menu = tk.Menu(self, tearoff=0)
         self.status_menu.add_command(label="Copy Row", command=self._copy_status_row)
-        self.status_menu.add_command(label="Copy All", command=self._copy_status_all)
+        self.status_menu.add_command(label="Copy Page", command=self._copy_status_all)
         self.status_menu.add_separator()
         self.status_menu.add_command(label="Save as CSV...", command=self.on_save_report)
         self.status_tree.bind("<Button-3>", self._show_status_menu)
 
-        # Storage backing the Treeview (used for sorting)
+        paging = ttk.Frame(status_tab)
+        paging.pack(fill="x")
+        self.btn_previous = ttk.Button(paging, text="Previous", command=lambda: self._change_page(-1))
+        self.btn_previous.pack(side="left")
+        self.page_label = ttk.Label(paging, text="Page 1 / 1 — 0 files")
+        self.page_label.pack(side="left", padx=8)
+        self.btn_next = ttk.Button(paging, text="Next", command=lambda: self._change_page(1))
+        self.btn_next.pack(side="left")
+
+        # Storage backing the visible Treeview page (used for sorting)
         self._status_raw = {}  # iid -> dict of raw values keyed by column id
         self._status_sort_state = {}  # col_id -> "asc" | "desc"
         self._status_row_count = 0
@@ -625,12 +722,14 @@ class App(tk.Tk):
         self._switch_to_log_on_compress = True
 
         # Periodic log consumption
-        self.after(100, self._drain_log_queue)
+        self._drain_after = self.after(100, self._drain_log_queue)
 
     # -------------
     # UI Helpers
     # -------------
     def choose_folder(self):
+        if self._busy:
+            return
         path = filedialog.askdirectory()
         if path:
             self.folder.set(path)
@@ -645,92 +744,97 @@ class App(tk.Tk):
         self.txt.delete("1.0", "end")
 
     def _disable_actions(self):
-        self.btn_status.config(state="disabled")
-        self.btn_compress.config(state="disabled")
+        self._busy = True
+        for widget in (self.btn_status, self.btn_compress, self.btn_decompress,
+                       self.btn_browse, self.ent_folder, self.ext_entry, self.exclude_entry,
+                       self.alg_combo, self.beh_combo, self.btn_clear_report):
+            widget.config(state="disabled")
         self.btn_stop.config(state="normal")
-        self.alg_combo.config(state="disabled")
-        self.beh_combo.config(state="disabled")
-        # Don't disable Save/Clear Report while a scan is running; user may still export.
 
     def _enable_actions(self):
-        self.btn_status.config(state="normal")
-        self.btn_compress.config(state="normal")
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self._busy = False
+        for widget in (self.btn_status, self.btn_compress, self.btn_decompress,
+                       self.btn_browse, self.ent_folder, self.ext_entry, self.exclude_entry):
+            widget.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.alg_combo.config(state="readonly")
         self.beh_combo.config(state="readonly")
-        if self.status_tree.get_children():
+        if self.report_store.count:
             self.btn_save_report.config(state="normal")
             self.btn_clear_report.config(state="normal")
 
+    def _send_log(self, message):
+        while not self._closing:
+            try:
+                self.log_q.put(message, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def _send_ui(self, action, value=None, cancellable=False):
+        while not self._closing:
+            if cancellable and self.stop_flag.is_set():
+                return False
+            try:
+                self.ui_q.put((action, value), timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     def _drain_log_queue(self):
+        messages = []
+        for _ in range(100):
+            try:
+                messages.append(self.log_q.get_nowait())
+            except queue.Empty:
+                break
+        if messages:
+            self.append_log_batch(messages)
+        deadline = time.monotonic() + 0.015
+        rows = []
+        latest_progress = None
         try:
-            messages = []
-            while True:
-                try:
-                    msg = self.log_q.get_nowait()
-                    messages.append(msg)
-                    # Limit batch size to keep UI responsive during heavy logging
-                    if len(messages) >= 500:
-                        break
-                except queue.Empty:
+            for _ in range(250):
+                if time.monotonic() >= deadline:
                     break
-
-            if messages:
-                self.append_log_batch(messages)
-
-            latest_progress = None
-            status_rows = []
-            status_clear = False
-            while True:
                 try:
                     action, value = self.ui_q.get_nowait()
                 except queue.Empty:
                     break
-                if action == "progress":
+                if action == "status_clear":
+                    # Respect queue order; never clear rows added after this marker.
+                    if rows:
+                        self._add_status_rows(rows)
+                        rows = []
+                    self._clear_status_report()
+                elif action == "status_row":
+                    rows.append(value)
+                elif action == "progress":
                     latest_progress = value
                 elif action == "progress_max":
-                    self.progress["maximum"] = value
-                    self.progress["value"] = 0
+                    latest_progress = 0
+                    self.progress["maximum"] = max(value, 1)
                 elif action == "enable":
                     self._enable_actions()
                 elif action == "size":
                     self.size_label.config(text=value)
-                elif action == "status_row":
-                    status_rows.append(value)
-                    if len(status_rows) >= 500:
-                        self._add_status_rows(status_rows)
-                        status_rows = []
-                elif action == "status_clear":
-                    status_clear = True
-            if status_clear:
-                self._clear_status_report()
-            if status_rows:
-                self._add_status_rows(status_rows)
+                elif action == "metrics":
+                    self.metrics_label.config(text=value)
+            if rows:
+                self._add_status_rows(rows)
             if latest_progress is not None:
                 self.progress["value"] = latest_progress
-
-        except Exception:
-            pass
+        except Exception as exc:
+            self.append_log("[UI error] " + str(exc))
         finally:
-            self.after(100, self._drain_log_queue)
+            if not self._closing:
+                self._drain_after = self.after(50, self._drain_log_queue)
 
     def append_log_batch(self, messages):
-        for msg in messages:
-            if msg.startswith("\r"):
-                # Replace last line
-                # Check if there is any text to replace
-                if self.txt.index("end-1c") != "1.0":
-                    # Delete current last line (excluding the final newline of the widget)
-                    # "end-1c" is the last character (usually \n). 
-                    # "end-1c linestart" is the start of that line.
-                    self.txt.delete("end-1c linestart", "end-1c")
-                self.txt.insert("end", msg[1:]) # Insert new text (no newline at end to keep it on same line)
-            else:
-                # Normal append
-                # Ensure we are on a new line if the previous one was a progress line
-                if self.txt.get("end-1c linestart", "end-1c").strip():
-                     self.txt.insert("end", "\n")
-                self.txt.insert("end", msg + "\n")
+        self.txt.insert("end", "\n".join(messages) + "\n")
         
         # Truncate log if it gets too long (keep last ~2000 lines)
         # This prevents the Text widget from slowing down the whole app
@@ -750,92 +854,69 @@ class App(tk.Tk):
     # Status report (Treeview) helpers
     # -------------
     def _clear_status_report(self):
-        for iid in self.status_tree.get_children(""):
-            self.status_tree.delete(iid)
-        self._status_raw.clear()
+        self.report_store.clear()
+        self.report_page = 0
         self._status_sort_state.clear()
-        self._status_row_count = 0
+        self._render_report_page()
         self.btn_save_report.config(state="disabled")
         self.btn_clear_report.config(state="disabled")
 
     def _add_status_rows(self, rows):
-        for row in rows:
-            iid = str(self._status_row_count)
-            self._status_row_count += 1
-            tag = "evenrow" if (self._status_row_count % 2 == 0) else "oddrow"
-            values = (
-                row.get("status", ""),
-                row.get("algorithm", ""),
-                row.get("size_disp", ""),
-                row.get("ondisk_disp", ""),
-                row.get("savings_disp", ""),
-                row.get("path", ""),
-            )
-            self.status_tree.insert("", "end", iid=iid, values=values, tags=(tag,))
-            # Store raw values for sorting
-            self._status_raw[iid] = {
-                "status":    row.get("status", ""),
-                "algorithm": row.get("algorithm", ""),
-                "size":      row.get("size_raw", -1),
-                "ondisk":    row.get("ondisk_raw", -1),
-                "savings":   row.get("savings_raw", -1.0),
-                "path":      row.get("path_raw", row.get("path", "").casefold()),
-            }
-        # Enable Save/Clear once we have at least one row
-        if rows:
-            self.btn_save_report.config(state="normal")
+        previous = self.report_store.count
+        self.report_store.append(rows)
+        if previous < (self.report_page + 1) * self.page_size:
+            self._render_report_page()
+        else:
+            self._update_page_controls()
+        self.btn_save_report.config(state="normal")
+        if not self._busy:
             self.btn_clear_report.config(state="normal")
 
+    def _render_report_page(self):
+        items = self.status_tree.get_children("")
+        if items:
+            self.status_tree.delete(*items)
+        self._status_raw.clear()
+        for index, row in enumerate(self.report_store.rows(self.report_page * self.page_size, self.page_size)):
+            iid = str(index)
+            values = tuple(row.get(key, "") for key in
+                ("status", "algorithm", "size_disp", "ondisk_disp", "savings_disp", "path"))
+            self.status_tree.insert("", "end", iid=iid, values=values,
+                                   tags=("evenrow" if index % 2 == 0 else "oddrow",))
+            self._status_raw[iid] = row
+        self._update_page_controls()
+
+    def _update_page_controls(self):
+        pages = max(1, (self.report_store.count + self.page_size - 1) // self.page_size)
+        self.page_label.config(text="Page %d / %d — %d files" %
+                               (self.report_page + 1, pages, self.report_store.count))
+        self.btn_previous.config(state="normal" if self.report_page else "disabled")
+        self.btn_next.config(state="normal" if self.report_page + 1 < pages else "disabled")
+
+    def _change_page(self, delta):
+        pages = max(1, (self.report_store.count + self.page_size - 1) // self.page_size)
+        self.report_page = max(0, min(pages - 1, self.report_page + delta))
+        self._render_report_page()
+
     def _sort_status(self, col):
-        if not self._status_raw:
+        if self._busy:
             return
-        raw = self._status_raw
-        prev = self._status_sort_state.get(col)
-        if prev is None:
-            reverse = False
-            self._status_sort_state[col] = "asc"
-        elif prev == "asc":
-            reverse = True
-            self._status_sort_state[col] = "desc"
-        else:
-            reverse = False
-            self._status_sort_state[col] = "asc"
-
-        def sort_key(iid):
-            v = raw[iid].get(col)
-            if v is None:
-                return (1, 0)
-            if isinstance(v, bool):
-                return (0, int(v))
-            if isinstance(v, (int, float)):
-                return (0, v)
-            return (0, str(v).lower())
-
-        items = list(self.status_tree.get_children(""))
-        items.sort(key=sort_key, reverse=reverse)
-        for idx, iid in enumerate(items):
-            self.status_tree.move(iid, "", idx)
-        self._apply_zebra()
-        # Update heading to show direction indicator
-        for c in STATUS_COL_IDS:
-            label = STATUS_COL_HEADINGS[c]
-            if c == col:
-                indicator = " ▲" if not reverse else " ▼"
-                self.status_tree.heading(c, text=label + indicator)
-            else:
-                self.status_tree.heading(c, text=label)
-
-    def _apply_zebra(self):
-        for idx, iid in enumerate(self.status_tree.get_children("")):
-            tag = "evenrow" if (idx % 2 == 0) else "oddrow"
-            self.status_tree.item(iid, tags=(tag,))
+        reverse = self._status_sort_state.get(col) == "asc"
+        self._status_sort_state[col] = "desc" if reverse else "asc"
+        self.report_store.sort_column = col
+        self.report_store.descending = reverse
+        self.report_page = 0
+        self._render_report_page()
+        for column in STATUS_COL_IDS:
+            self.status_tree.heading(column, text=STATUS_COL_HEADINGS[column] +
+                ((" ▼" if reverse else " ▲") if column == col else ""))
 
     def on_clear_report(self):
-        self._clear_status_report()
+        if not self._busy:
+            self._clear_status_report()
 
     def on_save_report(self):
-        items = self.status_tree.get_children("")
-        if not items:
+        if not self.report_store.count:
             messagebox.showinfo("Save Report", "There is no status report to export.")
             return
         path = filedialog.asksaveasfilename(
@@ -849,8 +930,8 @@ class App(tk.Tk):
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([STATUS_COL_HEADINGS[c] for c in STATUS_COL_IDS])
-                for iid in items:
-                    writer.writerow([self.status_tree.set(iid, c) for c in STATUS_COL_IDS])
+                for row in self.report_store.rows():
+                    writer.writerow([row.get(key, "") for key in ("status", "algorithm", "size_disp", "ondisk_disp", "savings_disp", "path")])
         except Exception as e:
             messagebox.showerror("Save Report", f"Failed to save report: {e}")
             return
@@ -879,8 +960,8 @@ class App(tk.Tk):
 
     def _copy_status_all(self):
         lines = ["\t".join(STATUS_COL_HEADINGS[c] for c in STATUS_COL_IDS)]
-        for iid in self.status_tree.get_children(""):
-            lines.append("\t".join(self.status_tree.set(iid, c) for c in STATUS_COL_IDS))
+        for row in self.report_store.rows(self.report_page * self.page_size, self.page_size):
+            lines.append("\t".join(str(row.get(key, "")) for key in ("status", "algorithm", "size_disp", "ondisk_disp", "savings_disp", "path")))
         if len(lines) == 1:
             return
         self.clipboard_clear()
@@ -890,363 +971,204 @@ class App(tk.Tk):
     # -------------
     # Operations
     # -------------
+    def _filters(self):
+        return parse_patterns(self.exclude_extensions.get()), parse_patterns(self.exclude_folders.get())
+
+    def on_close(self):
+        self.stop_flag.set()
+        self._closing = True
+        if self._drain_after is not None:
+            self.after_cancel(self._drain_after)
+            self._drain_after = None
+        if self.worker and self.worker.is_alive():
+            self.after(50, self.on_close)
+            return
+        self.worker = None
+        self.report_store.close()
+        self.destroy()
+
     def on_status(self):
         folder = self.folder.get().strip()
-        if not folder:
-            messagebox.showwarning("Warning", "Please select a folder first.")
+        if self._busy:
             return
-        if not os.path.isdir(folder):
-            messagebox.showerror("Error", "Folder not found.")
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("Warning", "Please select an existing folder.")
             return
-
-        self.ui_q.put(("status_clear", None))
-        try:
-            self.notebook.select(0)
-        except Exception:
-            pass
+        extensions, folders = self._filters()
+        self._clear_status_report()
+        self.notebook.select(0)
         self.stop_flag.clear()
         self._disable_actions()
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
 
         def worker():
+            count = 0
+            last_update = 0
             try:
-                files = list(iter_files_under(folder))
-                total = len(files)
-                self.ui_q.put(("progress_max", max(total, 1)))
-
-                for idx, path in enumerate(files, 1):
-                    if self.stop_flag.is_set():
+                def error(exc):
+                    self._send_log("[Error] " + str(exc))
+                    self._send_ui("status_row", dict(status="Error", algorithm="?",
+                        path=str(exc), path_raw=str(exc).casefold(), size_raw=-1,
+                        ondisk_raw=-1, savings_raw=-1), cancellable=True)
+                for info in scan_files(folder, extensions, folders, self.stop_flag, error):
+                    orig, disk, alg, path = info["size"], info["disk"], info["algorithm"], info["path"]
+                    row = dict(status="Uncompressed" if alg == "-" else "Compressed",
+                        algorithm=alg, size_disp=fmt_bytes(orig), size_raw=orig,
+                        ondisk_disp=fmt_bytes(disk), ondisk_raw=disk,
+                        savings_disp=percent_saving(orig, disk),
+                        savings_raw=max(0, (1 - disk / orig) * 100) if orig else 0,
+                        path=path, path_raw=path.casefold())
+                    if not self._send_ui("status_row", row, cancellable=True):
                         break
-
-                    try:
-                        # Algorithm
-                        alg = get_compression_algorithm(path)
-                        if alg is None:
-                            # Access denied - record an error row
-                            self.ui_q.put(("status_row", {
-                                "status":    "Error",
-                                "algorithm": "-",
-                                "size_disp": "?",
-                                "size_raw":  -1,
-                                "ondisk_disp": "?",
-                                "ondisk_raw": -1,
-                                "savings_disp": "?",
-                                "savings_raw": -1.0,
-                                "path":      path,
-                                "path_raw":  path.casefold(),
-                            }))
-                            self.ui_q.put(("progress", idx))
-                            continue
-
-                        # Sizes
-                        try:
-                            orig = os.path.getsize(path)
-                        except Exception:
-                            orig = None
-                        ondisk = get_size_on_disk(path)
-
-                        # Status
-                        status = "Compressed" if (alg != "-" and alg is not None) else "Uncompressed"
-
-                        # Savings raw value (used for sorting)
-                        savings_raw = -1.0
-                        if orig is not None and ondisk is not None and orig > 0:
-                            if ondisk < orig:
-                                savings_raw = (1.0 - (ondisk / orig)) * 100.0
-                            else:
-                                savings_raw = 0.0
-
-                        size_raw = orig if orig is not None else -1
-                        ondisk_raw = ondisk if ondisk is not None else -1
-
-                        self.ui_q.put(("status_row", {
-                            "status":      status,
-                            "algorithm":   alg if alg is not None else "-",
-                            "size_disp":   fmt_bytes(orig),
-                            "size_raw":    size_raw,
-                            "ondisk_disp": fmt_bytes(ondisk),
-                            "ondisk_raw":  ondisk_raw,
-                            "savings_disp": percent_saving(orig, ondisk),
-                            "savings_raw": savings_raw,
-                            "path":        path,
-                            "path_raw":    path.casefold(),
-                        }))
-
-                    except Exception as e:
-                        self.ui_q.put(("status_row", {
-                            "status":      "Error",
-                            "algorithm":   "-",
-                            "size_disp":   "?",
-                            "size_raw":    -1,
-                            "ondisk_disp": "?",
-                            "ondisk_raw":  -1,
-                            "savings_disp": "?",
-                            "savings_raw": -1.0,
-                            "path":        f"[Error: {e}] {path}",
-                            "path_raw":    path.casefold(),
-                        }))
-
-                    self.ui_q.put(("progress", idx))
-
+                    count += 1
+                    if time.monotonic() - last_update >= 0.25:
+                        self._send_ui("metrics", "Scanned %d files" % count)
+                        last_update = time.monotonic()
+                self._send_ui("metrics", "%s: %d files" %
+                              ("Scan stopped" if self.stop_flag.is_set() else "Scan complete", count))
+            except Exception as exc:
+                self._send_log("[Error] Scan failed: " + str(exc))
             finally:
-                self.ui_q.put(("enable", None))
-
+                self._send_ui("enable")
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
-    def on_compress(self):
+    def on_compress(self, decompress=False):
+        if self._busy:
+            return
         folder = self.folder.get().strip()
         if not folder or not os.path.isdir(folder):
-            messagebox.showwarning("Warning", "Please select a valid folder.")
+            messagebox.showwarning("Warning", "Please select an existing folder.")
             return
-
-        # Algorithm selection
-        alg_label = self.alg_label.get()
-        alg_switch = None
-        for label, val in ALG_OPTIONS:
-            if label == alg_label:
-                alg_switch = val
-                break
-        if not alg_switch:
-            messagebox.showerror("Error", "Could not select algorithm.")
-            return
-
-        # Behavior selection
-        beh_label = self.beh_label.get()
-        behavior = None
-        for label, val in BEHAVIOR_OPTIONS:
-            if label == beh_label:
-                behavior = val
-                break
-        
-        is_verbose = self.verbose.get()
-
-        self.clear_log()
-        self.append_log(f"Starting compression → Algorithm: {alg_label}, Behavior: {beh_label}")
-        # Switch to the compression log tab so streaming output is visible.
         try:
-            self.notebook.select(1)
-        except Exception:
-            pass
+            if check_volume(folder).upper() != "NTFS":
+                raise OSError("This operation requires an NTFS volume.")
+            check_write_access(folder)
+        except Exception as exc:
+            messagebox.showerror("Cannot start", str(exc))
+            return
+        extensions, folders = self._filters()
+        algorithm = dict(ALG_OPTIONS).get(self.alg_label.get())
+        behavior = dict(BEHAVIOR_OPTIONS).get(self.beh_label.get())
+        if not algorithm or not behavior:
+            messagebox.showerror("Error", "Invalid operation options.")
+            return
+        if decompress and not messagebox.askyesno("Decompress", "Remove compression from matching files in this folder?"):
+            return
+        verbose = self.verbose.get()
+        self.clear_log()
+        self.notebook.select(1)
         self.stop_flag.clear()
         self._disable_actions()
-        
+        self.progress.stop()
+        self.progress.configure(mode="determinate", value=0, maximum=1)
+
         def worker():
+            before = original = eligible = eligible_bytes = skipped = scan_errors = 0
+            measurement_errors = 0
+            started = time.monotonic()
+            last_update = 0
+            stats = dict(successful=0, failed=0, skipped=0, cancelled=0, bytes=0)
+            def scan_error(exc):
+                nonlocal scan_errors
+                scan_errors += 1
+                self._send_log("[Error] " + str(exc))
             try:
-                self.log_q.put("Performing initial measurement (this may take a while)...")
-                self.ui_q.put(("size", "Performing initial measurement..."))
-                
-                orig, disk = get_folder_sizes(folder)
-                self.before_disk = disk
-                
-                res_text = f"On Disk (Initial): {fmt_bytes(disk)} / Actual: {fmt_bytes(orig)}"
-                self.ui_q.put(("size", res_text))
-                self.log_q.put(f"Initial size: {fmt_bytes(disk)} (On Disk) / {fmt_bytes(orig)} (Actual)")
-
-                self.log_q.put("Listing files...")
-                files = list(iter_files_under(folder))
-                total = len(files)
-                self.ui_q.put(("progress_max", max(total, 1)))
-                self.log_q.put(f"Found {total} files. Analyzing compression status...")
-                
-                to_compress = []
-
-                for idx, path in enumerate(files, 1):
+                # Disk-backed operation plan avoids retaining every path in memory.
+                with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as plan:
+                    self._send_ui("metrics", "Scanning matching files...")
+                    scanned = 0
+                    for info in scan_files(folder, extensions, folders, self.stop_flag, scan_error):
+                        scanned += 1
+                        before += info["disk"]
+                        original += info["size"]
+                        current = info["algorithm"]
+                        needed = current != "-" if decompress else compression_action(
+                            None if current == "-" else current, algorithm, behavior) != "skip"
+                        if needed:
+                            eligible += 1
+                            eligible_bytes += info["size"]
+                            plan.write(json.dumps((info["path"], info["size"])) + "\n")
+                        else:
+                            skipped += 1
+                        if time.monotonic() - last_update >= 0.25:
+                            self._send_ui("metrics", "Scanned %d | Selected %d | Skipped %d" % (scanned, eligible, skipped))
+                            last_update = time.monotonic()
+                    self.before_disk = before
+                    self._send_ui("size", "Matching files — Before: %s / Actual: %s" % (fmt_bytes(before), fmt_bytes(original)))
+                    self._send_ui("progress_max", eligible)
                     if self.stop_flag.is_set():
-                        self.log_q.put("[Stopped]")
+                        self._send_log("Stopped during scan; no operation started.")
+                        self._send_ui("metrics", "Stopped during scan; no files changed.")
                         return
-
-                    try:
-                        current_alg = get_compression_algorithm(path)
-                        if current_alg is None:
-                            self.log_q.put(f"[Error: Access denied] {path}")
-                            continue
-                        if current_alg == "-":
-                            current_alg = None
-
-                        if compression_action(current_alg, alg_switch, behavior) != "skip":
-                            to_compress.append(path)
-
-                    except Exception as e:
-                        self.log_q.put(f"[Error: {e}] {path}")
-
-                    if is_verbose and idx % 100 == 0:
-                         self.log_q.put(f"Analyzed {idx}/{total} files...")
-                    self.ui_q.put(("progress", idx))
-
-                self.log_q.put(f"Analysis complete. Compressing {len(to_compress)} files.")
-                
-                batch_size = get_optimal_batch_size()
-                self.log_q.put(f"Batch size calculated: {batch_size} files per chunk (based on system memory).")
-
-                total_ops = len(to_compress)
-                self.ui_q.put(("progress_max", max(total_ops, 1)))
-                
-                current_progress = 0
-                current_header_dir = ""
-                
-                # Error counters for non-verbose mode
-                error_counts = {"Long Path": 0, "Other": 0}
-                last_update_time = 0
-
-                def update_status_line(force=False):
-                    import time
-                    nonlocal last_update_time
-                    now = time.time()
-                    # Update at most every 0.5 seconds unless forced, to avoid UI flicker
-                    if not force and (now - last_update_time < 0.5):
-                        return
-                    last_update_time = now
-
-                    pct = (current_progress / max(total_ops, 1)) * 100.0
-                    pct_str = f"{int(pct)}%" if pct % 1 == 0 else f"{pct:.2f}%"
-                    
-                    # ASCII Bar: [████░░░░░░]
-                    bar_len = 20
-                    filled = int((pct / 100.0) * bar_len)
-                    bar = "█" * filled + "░" * (bar_len - filled)
-                    
-                    status_msg = f"\rCompressing [{bar}] {pct_str} complete"
-                    
-                    err_parts = []
-                    if error_counts["Long Path"] > 0:
-                        err_parts.append(f"{error_counts['Long Path']} (Long Path)")
-                    if error_counts["Other"] > 0:
-                        err_parts.append(f"{error_counts['Other']} (Other)")
-                    
-                    if err_parts:
-                        status_msg += " | Errors: " + ", ".join(err_parts)
-                    
-                    self.log_q.put(status_msg)
-
-                def progress_cb(count):
-                    nonlocal current_progress
-                    current_progress += count
-                    self.ui_q.put(("progress", current_progress))
-                    if not is_verbose:
-                        update_status_line()
-
-                def log_callback(line):
-                    nonlocal current_header_dir
-                    
-                    # Filter empty lines
-                    if not line.strip():
-                        return
-                    
-                    # Check for errors/skips to update counters
-                    if line.startswith("[Skipped] Path too long"):
-                        error_counts["Long Path"] += 1
-                        if not is_verbose:
-                            update_status_line(force=True)
+                    operation_start = time.monotonic()
+                    last_update = 0
+                    def metrics(current, force=False):
+                        nonlocal last_update
+                        now = time.monotonic()
+                        if not force and now - last_update < 0.25:
                             return
-                    elif line.startswith("[Error]"):
-                        error_counts["Other"] += 1
-                        if not is_verbose:
-                            update_status_line(force=True)
-                            return
+                        last_update = now
+                        elapsed = now - operation_start
+                        processed = current["successful"] + current["failed"] + current["skipped"]
+                        speed = current["bytes"] / max(elapsed, 0.001)
+                        remaining = max(0, eligible_bytes - current["bytes"])
+                        eta = "%.0fs" % (remaining / speed) if speed else "?"
+                        self._send_ui("progress", processed)
+                        self._send_ui("metrics", "Success %d | Failed %d | Scan errors %d | Skipped %d | Elapsed %.0fs | Processed %s/s | ETA ~%s" %
+                            (current["successful"], current["failed"], scan_errors,
+                             skipped + current["skipped"], now - started, fmt_bytes(speed), eta))
+                    def verify(path):
+                        final = get_compression_algorithm(path)
+                        return final == "-" if decompress else final is not None and final.casefold() == algorithm.casefold()
+                    def output(line):
+                        if verbose or line.startswith(("[Error]", "[Skipped]")):
+                            self._send_log(line)
+                    plan.seek(0)
+                    files = (tuple(json.loads(line)) for line in plan)
+                    args = ["/u", "/i", "/f"] if decompress else ["/c", "/i", "/f", "/exe:" + algorithm]
+                    stats = run_compact_stream(args, files, output, self.stop_flag,
+                        verify=verify, result_callback=metrics)
+                    metrics(stats, force=True)
+                cancelled = self.stop_flag.is_set()
+                # Invalidate the pre-operation report even if final measurement fails.
+                self._send_ui("status_clear")
+                # Remeasure only the same filtered scope. Cancellation skips the expensive pass.
+                if not cancelled:
+                    self._send_ui("metrics", "Verifying final size...")
+                    after = 0
+                    measured = 0
+                    final_errors = 0
+                    def final_error(exc):
+                        nonlocal final_errors
+                        final_errors += 1
+                        self._send_log("[Error] Final measurement: " + str(exc))
+                    for path in iter_files_under(folder, extensions, folders, self.stop_flag, final_error):
+                        disk = get_size_on_disk(path)
+                        if disk is None:
+                            final_error(OSError("Cannot measure " + path))
+                        else:
+                            after += disk
+                            measured += 1
+                    if not self.stop_flag.is_set():
+                        self._send_ui("size", "Matching files — Before: %s | After: %s | Change: %s%s" %
+                            (fmt_bytes(before), fmt_bytes(after), fmt_bytes(before - after),
+                             " (partial measurement)" if scan_errors or final_errors or measured != scanned else ""))
+                    measurement_errors = final_errors
+                remaining = max(0, eligible - stats["successful"] - stats["failed"] - stats["skipped"])
+                summary = "%s — Successful: %d; Failed: %d; Skipped: %d; Unprocessed: %d; Scan errors: %d; Measurement errors: %d; Elapsed: %.1fs" % (
+                    "Stopped" if self.stop_flag.is_set() else "Completed with errors" if stats["failed"] or scan_errors or measurement_errors else "Completed",
+                    stats["successful"], stats["failed"], skipped + stats["skipped"],
+                    remaining, scan_errors, measurement_errors, time.monotonic() - started)
+                self._send_log(summary)
+                self._send_ui("metrics", summary)
 
-                    # Capture directory header
-                    if "Compressing files in" in line:
-                        parts = line.split("Compressing files in")
-                        if len(parts) > 1:
-                            current_header_dir = parts[1].strip()
-                        return
-
-                    # Filter batch summary lines
-                    # "50 files within 50 directories were compressed."
-                    # "206.705.328 total bytes of data are stored in 178.282.496 bytes."
-                    # "The compression ratio is 1,2 to 1."
-                    if "files within" in line and "directories were compressed" in line:
-                        return
-                    if "total bytes of data are stored in" in line:
-                        return
-                    if "The compression ratio is" in line:
-                        return
-                    
-                    # Parse compact.exe file output
-                    
-                    # Regex 1: compact /c output (Compression)
-                    # Format: Filename   Size : Compressed = Ratio to 1 [OK]
-                    # Example: test.txt   100 : 50 = 2,0 to 1 [OK]
-                    match_c = re.match(r'^(.*?)\s+(\d+)\s*:\s*(\d+)\s*=\s*([\d,.]+)\s+to\s+1\s+\[OK\]$', line)
-                    if match_c:
-                        filename, orig_s, comp_s, ratio_s = match_c.groups()
-                        try:
-                            orig = int(orig_s)
-                            comp = int(comp_s)
-                            if orig > 0:
-                                percentage = (comp / orig) * 100.0
-                            else:
-                                percentage = 100.0
-                            
-                            # Format path: ...\parent\filename
-                            fname = filename.strip()
-                            if current_header_dir:
-                                fname = os.path.join(current_header_dir, fname)
-
-                            try:
-                                head, tail = os.path.split(fname)
-                                if head:
-                                    parent = os.path.basename(head)
-                                    display_name = f"...{os.path.sep}{parent}{os.path.sep}{tail}"
-                                else:
-                                    display_name = fname
-                            except:
-                                display_name = fname
-                            
-                            pair = human_size_pair(orig, comp)
-                            if is_verbose:
-                                self.log_q.put(f"[OK] {display_name} | {pair} ({percentage:.1f}%)")
-                            return
-                        except ValueError:
-                            pass
-
-                    # Regex 2: compact /q output (Query - if used)
-                    # Format:   Size : Compressed = Ratio to 1 Attr Filename
-                    match_q = re.match(r'^\s*(\d+)\s*:\s*(\d+)\s*=\s*([\d,.]+)\s+to\s+1\s+[A-Z]+\s+(.*)$', line)
-                    if match_q:
-                        orig_s, comp_s, ratio_s, filename = match_q.groups()
-                        try:
-                            orig = int(orig_s)
-                            comp = int(comp_s)
-                            if orig > 0:
-                                percentage = (comp / orig) * 100.0
-                            else:
-                                percentage = 100.0
-                            
-                            pair = human_size_pair(orig, comp)
-                            if is_verbose:
-                                self.log_q.put(f"[OK] {filename.strip()} | {pair} ({percentage:.1f}%)")
-                            return
-                        except ValueError:
-                            pass
-                    
-                    if is_verbose:
-                        self.log_q.put(line)
-
-                if self.stop_flag.is_set():
-                    self.log_q.put("[Stopped]")
-                    return
-
-                # 2) Compress batch (Use /f to force recompression if needed)
-                if to_compress:
-                    if is_verbose:
-                        self.log_q.put("--- Compressing ---")
-                    else:
-                        # Initial status line
-                        update_status_line(force=True)
-                        
-                    run_compact_stream(["/c", "/i", "/f", "/exe:{}".format(alg_switch)], to_compress, log_callback, self.stop_flag, progress_cb)
-
-                self.log_q.put("\nFinished.")
-
+            except Exception as exc:
+                self._send_log("[Error] Operation failed: " + str(exc))
+                self._send_ui("metrics", "Operation failed: " + str(exc))
             finally:
-                self.ui_q.put(("enable", None))
-                orig, disk = get_folder_sizes(folder)
-                text = f"On Disk: {fmt_bytes(disk)} / Actual: {fmt_bytes(orig)}"
-                if self.before_disk:
-                    text += f"   (Before: {fmt_bytes(self.before_disk)})"
-                self.ui_q.put(("size", text))
-
+                self._send_ui("enable")
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
 
