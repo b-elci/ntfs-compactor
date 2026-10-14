@@ -397,7 +397,7 @@ def register_context_menu(remove=False):
                 try:
                     name = winreg.EnumKey(key, 0)
                 except OSError as exc:
-                    if getattr(exc, 'winerror', exc.errno) != 259:
+                    if (getattr(exc, 'winerror', None) or exc.errno) != 259:
                         raise
                     break
                 delete_tree(path + '\\' + name)

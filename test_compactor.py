@@ -442,7 +442,10 @@ class FakeRegistry:
     def EnumKey(self, key, index):
         prefix = key.path + '\\'
         children = sorted({path[len(prefix):].split('\\')[0] for path in self.keys if path.startswith(prefix)})
-        if index >= len(children): raise OSError(259, 'No more items')
+        if index >= len(children):
+            error = OSError(259, 'No more items')
+            error.winerror = 259
+            raise error
         return children[index]
     def DeleteKey(self, hive, path):
         del self.keys[path]
