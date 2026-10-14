@@ -1,0 +1,67 @@
+name: Publish validated v1.6.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-v1.6.0.yml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v1.6.0
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify and publish the existing tested package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TESTED_COMMIT: 3b994d57856a9f837f7b599e51236a58aa355d5b
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$TESTED_COMMIT" origin/main
+          gh release view v1.6.0 --json isDraft,targetCommitish,body > release.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path('release.json').read_text())
+          if data['targetCommitish'] != os.environ['TESTED_COMMIT']:
+              raise SystemExit('Release does not target the validated commit')
+          if not data['isDraft']:
+              raise SystemExit('Release is already published; refusing to edit it')
+          notes = data['body'] + '\n\nKnown antivirus warning: Trend Micro Apex One can block this unsigned release as "Newly Encountered Program Detected" (potential ransomware). The Microsoft Defender checks do not establish acceptance by Trend Micro. No code-signing certificate is configured, and this release does not resolve that reputation warning.\n'
+          Path('release-notes.md').write_text(notes)
+          PY
+          mkdir release-assets
+          gh release download v1.6.0 --dir release-assets
+          python - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('release-assets')
+          archive = root / 'NTFS-Compactor-v1.6.0-Windows-x64.zip'
+          report = json.loads((root / 'validation.json').read_text())
+          with archive.open('rb') as source:
+              digest = hashlib.file_digest(source, 'sha256').hexdigest()
+          checksum = (root / (archive.name + '.sha256')).read_text().split()[0]
+          assert digest == checksum == report['zip_sha256'], 'Package checksum mismatch'
+          assert report['commit'] == os.environ['TESTED_COMMIT'], 'Build commit mismatch'
+          assert report['version'] == '1.6.0', 'Build version mismatch'
+          assert report['unit_test_count'] >= 46, 'Incomplete test evidence'
+          for key in ('folder_scan', 'zip_scan'):
+              assert report[key]['status'] == 'passed', 'Defender scan did not pass'
+              assert report[key]['exit_code'] == 0 and report[key]['new_detection_count'] == 0
+          print('Verified ZIP SHA-256:', digest)
+          PY
+          gh release edit v1.6.0 --draft=false --latest \
+            --title 'NTFS Compactor v1.6.0 — Windows x64' \
+            --notes-file release-notes.md

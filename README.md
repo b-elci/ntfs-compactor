@@ -56,10 +56,10 @@ A modern GUI application for Windows that enables advanced NTFS compression usin
 
 1. **Download the latest release**
    - Go to [Releases](https://github.com/b-elci/ntfs-compactor/releases)
-   - For the v1.6.0 candidate, download `NTFS-Compactor-v1.6.0-Windows-x64.zip`
+   - For v1.6.0, download `NTFS-Compactor-v1.6.0-Windows-x64.zip`
    - Extract the complete folder and run `NTFS-Compactor-v1.6.0.exe`; keep `_internal` beside it
    - Protected folders may require administrator rights
-   - The candidate is unsigned; SmartScreen may show an unknown-publisher warning
+   - The release is unsigned; SmartScreen may show an unknown-publisher warning. Trend Micro Apex One can block it as "Newly Encountered Program Detected"; this release does not resolve that warning.
    - No Python installation needed!
 
 2. **Or clone the repository** (for Python users)
